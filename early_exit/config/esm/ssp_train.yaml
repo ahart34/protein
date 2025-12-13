@@ -1,0 +1,56 @@
+output_dir: ~/scratch/anna19/protein_output
+
+dataset:
+  class: SecondaryStructure
+  path: ~/scratch/anna19/ssp/
+  atom_feature: null
+  bond_feature: null
+  transform:
+    class: Compose
+    transforms:
+      - class: ProteinView
+        view: residue
+      - class: TruncateProtein
+        max_length: 550
+
+test_split: cb513
+
+task:
+  class: NodePropertyPredictionAllLayers
+  model:
+    class: CustomESM2
+    #path: {{ modeldir }}
+    model: "CustomESM2"
+  criterion: ce
+  metric: ['macro_acc']
+  num_mlp_layer: 2
+  num_class: 3
+
+
+optimizer:
+  class: Adam
+  lr: 2.0e-4
+
+scheduler:
+  class: ReduceLROnPlateau
+  factor: 0.6
+  patience: 5
+
+engine:
+  gpus: [0, 1, 2, 3]
+  batch_size: 4
+  log_interval: 1000
+
+eval_metric: macro_acc
+lr_ratio: 0
+
+model_checkpoint: {{ ckpt }}
+train_all_layers: True
+
+checkpoint_path: '/shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_ssp'
+evaluation_path_test: '/shared/nas2/anna19/protein/early_exit/results/metrics/esm_ssp_evaluation_test'
+evaluation_path_valid: '/shared/nas2/anna19/protein/early_exit/results/metrics/esm_ssp_evaluation_valid'
+
+
+train:
+  num_epoch: 100

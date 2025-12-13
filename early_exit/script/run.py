@@ -1,0 +1,230 @@
+import os
+import sys
+import math
+import pprint
+import random
+
+import numpy as np
+
+import torch
+from torch.optim import lr_scheduler
+import os
+import pickle
+import time
+from torchdrug import core, models, tasks, datasets, utils
+from torchdrug.utils import comm
+import sys
+sys.path.append('/shared/nas2/anna19/protein/early_exit/model')
+from custom_esm2 import CustomESM2
+from custom_protbert import CustomProtBert
+from custom_protalbert import CustomProtAlbert
+import time
+
+sys.path.append(os.path.dirname(os.path.dirname(__file__)))
+import util
+import dataset, task
+import glob
+import csv
+
+def train_and_validate_all_layers(cfg, solver, scheduler):
+    print("training and validating all layers")
+    if cfg.train.num_epoch == 0:
+        return
+    checkpoint_path = cfg.checkpoint_path
+    os.makedirs(checkpoint_path, exist_ok=True)
+    step = math.ceil(cfg.train.num_epoch / 500)
+    best_result = float("-inf")
+    best_epoch = -1
+
+    for i in range(0, cfg.train.num_epoch, step):
+        print(f"epoch {i}")
+        kwargs = cfg.train.copy()
+        kwargs["num_epoch"] = min(step, cfg.train.num_epoch - i)
+        solver.train(**kwargs)
+        # first = solver.model.mlp[0].module[-1]
+        # print(f"[EPOCH {i}] Linear in/out = {first.in_features}/{first.out_features}")
+        print("finish train")
+        metric = solver.evaluate("valid")
+        for k, v in metric.items():
+           if k.startswith(cfg.eval_metric):
+               result = v
+               print(f"{k}: {result}")
+
+        if not math.isnan(result.item()) and result.item() > best_result:
+            best_result = result.item()
+            best_epoch = i
+            best_epoch = solver.epoch
+            checkpoint_file = os.path.join(checkpoint_path, "model_epoch%d.pth" % solver.epoch)
+            for fn in glob.glob(checkpoint_path):
+                try:
+                    if os.path.isfile(fn):
+                        os.remove(fn)
+                except FileNotFoundError:
+                    pass
+            solver.save(checkpoint_file)
+        if isinstance(scheduler, lr_scheduler.ReduceLROnPlateau):
+            scheduler.step(result)
+        print("scheduler stepped")
+    print(f"best epoch = {best_epoch}")
+    best_checkpoint = os.path.join(checkpoint_path, "model_epoch%d.pth" % best_epoch)
+    solver.load(best_checkpoint)
+    evaluate_by_layers(cfg, solver, scheduler)
+    print(f"best_epoch = {best_epoch}")
+    #return solver
+    return
+
+def parse_to_csv(data, fn):
+    import re
+    import csv
+    pattern = re.compile(r"^(.+?) Layer (\d+)$")             #flipped to pattern = re.compile(r"^layer (\d+) (.+)$")  for EC, GO               
+    parsed_data = {}
+    for key, value in data.items():
+        match = pattern.match(key)
+        if match:
+            layer_idx = int(match.group(2))
+            metric_name = match.group(1)
+            if layer_idx not in parsed_data:
+                parsed_data[layer_idx] = {}
+            parsed_data[layer_idx][metric_name] = value
+    all_metrics = sorted({metric for layer in parsed_data.values() for metric in layer.keys()})
+    with open(fn, 'w', newline = '') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Layer"] + all_metrics)
+        for layer_idx in sorted(parsed_data.keys()):
+            row = [layer_idx] + [parsed_data[layer_idx].get(metric, "").item() for metric in all_metrics]
+            writer.writerow(row)
+    return
+
+def evaluate_by_layers(cfg, solver, scheduler):
+    #evaluation_results = solver.evaluate("valid")
+    #parse_to_csv(evaluation_results, cfg.evaluation_path_valid)
+    evaluation_results = solver.evaluate("test")
+    parse_to_csv(evaluation_results, cfg.evaluation_path_test)
+    return 
+
+def evaluate_multiple_thresholds(cfg, solver, scheduler, last=False):
+    os.environ["RESULT_FILE"] = "/shared/nas2/anna19/early_exit/esm-s/results/non_necessary"
+    import csv
+    if last== True:
+        os.environ["SELECT_LAST"] = "True"
+        print("selecting last")
+    result_file = cfg.get("evaluation_result_file_stem")
+    os.makedirs(cfg.result_pickle, exist_ok=True)
+    #from fvcore.nn import FlopCountAnalysis
+    # def wrapped_predict(batch, *args, **kwargs):
+    #     nonlocal total_flops_this_threshold
+    #     # count flops on this batch
+    #     tensor_input = batch["graph"]
+    #     batch_flops = FlopCountAnalysis(solver.model, tensor_input).total()
+    #     total_flops_this_threshold += batch_flops
+    #     return original_predict(batch, *args, **kwargs)
+    #for t in np.arange(0, 1, .01):
+    #for t in np.arange(0, 1, .01):
+    if cfg.get("property") is not None:
+        print("evaluating property")
+        evaluation_result_file = f"{result_file}.csv" #Insert evaluation_result_file here 
+        #for t in np.concatenate([np.arange(0, 1, .04), np.arange(.982, 1, .002), np.arange(.9982, 1, .0002), np.array([1.0])]): #for esm2
+        for t in np.concatenate([np.arange(0, .8, .2), np.arange(.8, 1, .08), np.arange(.982, 1, .004), np.arange(.999, 1, .0002), np.array([1.0])]): #for albert
+        #for t in np.concatenate([np.arange(0.98, 1, 0.001), np.arange(0.999, 1, 0.0001), np.arange(.9999, 1, .00001), np.array([1.0])]):
+        #for t in np.arange(.999, 1, .0001):
+        #for t in np.arange(.9999, 1, .00001):
+        #for t in np.concatenate([np.arange(0, .88, .08), np.arange(.88, .96, .02), np.arange(.96, 1, .01), np.arange(.99, 1, .005), np.array([1.0])]):
+            #total_flops_this_threshold = 0
+            #original_predict = solver.model.predict
+            #solver.model.predict = wrapped_predict
+            os.environ["THRESHOLD"] = str(t)
+            os.environ["RESULT_PICKLE"] = f"{cfg.result_pickle}/run_{t:.5f}.pkl"
+            print(f"evaluating on threshold {t}")
+            times = time.time()
+            metric = solver.evaluate("test")
+            timef = time.time()
+            acc = metric["acc"]
+            timee = timef - times
+            layer = metric["layer"]
+            with open(evaluation_result_file, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([t, acc, layer, timee])
+
+    else:
+        #for percent in [30, 50,95]:
+        for percent in [95]:
+            cfg.dataset.split = "test"
+            print(f"evaluating percent {percent}")
+            cfg.dataset.percent = percent
+            test_set = core.Configurable.load_config_dict(cfg.dataset)
+            solver.test_set = test_set
+            evaluation_result_file = f"{result_file}_percent{percent}.csv" #Insert evaluation_result_file here 
+            os.environ["RESULT_FILE"] = str(evaluation_result_file)
+            #for t in np.concatenate([np.arange(0, 1, .02), np.arange(.982, 1, .002), np.arange(.9982, 1, .0002), np.array([1.0])]):
+            #for t in np.concatenate([np.arange(0.98, 1, 0.001), np.arange(0.999, 1, 0.0001), np.arange(.9999, 1, .00001), np.array([1.0])]):
+            #for t in np.arange(.999, 1, .0001):
+            #for t in np.arange(.9999, 1, .00001):
+            
+            for t in np.concatenate([np.arange(0, .88, .08), np.arange(.88, .96, .02), np.arange(.96, 1, .01), np.arange(.99, 1, .005), np.array([1.0])]):
+                os.environ["THRESHOLD"] = str(t)
+                os.environ["RESULT_PICKLE"] = f"{cfg.result_pickle}/run_{percent}_{t:.5f}.pkl"
+                print(f"evaluating on threshold {t}")
+                cfg.threshold = t
+                time_s = time.time()
+                result = solver.evaluate("test")
+                time_f = time.time()
+                timee = time_f - time_s
+                with open(evaluation_result_file, 'a') as f:
+                    writer = csv.writer(f)
+                    writer.writerow([os.getenv("THRESHOLD"), result["f1"], result["avg_layer"], timee])
+
+    return None
+
+if __name__ == "__main__":
+    args, vars = util.parse_args()
+    cfg = util.load_config(args.config, context=vars)
+    working_dir = util.create_working_directory(cfg)
+    
+    seed = args.seed
+    print(f"SEED = {seed}")
+    torch.manual_seed(seed + comm.get_rank())
+    os.environ['PYTHONHASHSEED'] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+    logger = util.get_root_logger()
+    if comm.get_rank() == 0:
+        logger.warning("Config file: %s" % args.config)
+        logger.warning(pprint.pformat(cfg))
+
+    if cfg.get("evaluate_layer_only"): #AH
+        ##CODE FOR EVALUATING PLAIN MODEL WITH MLP AT EACH LAYER# 
+        print("evalute by layers")
+        if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+            cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+            train_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+            valid_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
+            test_set = core.Configurable.load_config_dict(cfg.dataset)
+            dataset = (valid_set, valid_set, test_set)
+        else:
+            dataset = core.Configurable.load_config_dict(cfg.dataset)
+        solver, scheduler = util.build_downstream_solver(cfg, dataset)
+        evaluate_by_layers(cfg, solver, scheduler)
+    elif cfg.get("train_all_layers"):
+        print("training all layers")
+        #CODE FOR TRAINING ALL MLPS IN LAYERS##
+        if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+            cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+            train_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+            valid_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
+            test_set = core.Configurable.load_config_dict(cfg.dataset)
+            dataset = (train_set, valid_set, test_set)
+        else:
+            dataset = core.Configurable.load_config_dict(cfg.dataset)
+        solver, scheduler = util.build_downstream_solver(cfg, dataset)
+        train_and_validate_all_layers(cfg, solver, scheduler)
