@@ -52,4 +52,4 @@ evaluation_path_test: '/shared/nas2/anna19/protein/early_exit/results/metrics/al
 evaluation_path_valid: '/shared/nas2/anna19/protein/early_exit/results/metrics/albert_ssp_evaluation_valid'
 
 train:
-  num_epoch: 50
+  num_epoch: 100

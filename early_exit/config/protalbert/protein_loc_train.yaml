@@ -39,7 +39,7 @@ engine:
 lr_ratio: 0
 
 train:
-  num_epoch: 50
+  num_epoch: 100
 
 train_all_layers: True
 
