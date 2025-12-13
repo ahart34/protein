@@ -16,6 +16,7 @@ task:
   class: FunctionAnnotation_AllLayers
   model:
     class: CustomProtAlbert
+    #path: {{ modeldir }}
     model: "CustomProtAlbert"
   mlp_batch_norm: True
   mlp_dropout: 0.2
@@ -40,11 +41,10 @@ lr_ratio: 0.0
 
 model_checkpoint: {{ ckpt }}
 train_all_layers: True
-load_weights_only: True
-checkpoint_path: /shared/nas2/anna19/early_exit/esm-s/model_checkpoints_protbert/ec/
-evaluation_path_valid: /shared/nas2/anna19/early_exit/esm-s/results_protbert/ec_regular_valid_protalbert.pkl
-evaluation_path_test: /shared/nas2/anna19/early_exit/esm-s/results_protbert/ec_regular_test_protalbert.pkl
 
+checkpoint_path: '/shared/nas2/anna19/protein/early_exit/results/model_checkpoints/albert_ec'
+evaluation_path_test: '/shared/nas2/anna19/protein/early_exit/results/metrics/albert_ec_evaluation_test'
+evaluation_path_valid: '/shared/nas2/anna19/protein/early_exit/results/metrics/albert_ec_evaluation_valid'
 
 train:
   num_epoch: 25

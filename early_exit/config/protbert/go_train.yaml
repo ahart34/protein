@@ -1,0 +1,50 @@
+output_dir: ~/scratch/anna19/protein_output
+
+dataset:
+  class: GO
+  path: {{ datadir }}
+  level: {{level}}
+  percent: 95
+  transform:
+    class: Compose
+    transforms:
+      - class: ProteinView
+        view: residue
+      - class: TruncateProtein
+        max_length: 550
+
+task:
+  class: FunctionAnnotation_AllLayers
+  model:
+    class: CustomProtBert
+    #path: {{ modeldir }}
+    model: "CustomProtBert"
+  mlp_batch_norm: True
+  mlp_dropout: 0.2
+  metric: ['auprc@micro', 'f1_max']
+
+optimizer:
+  class: Adam
+  lr: 1.0e-4
+
+scheduler:
+  class: ReduceLROnPlateau
+  factor: 0.6
+  patience: 5
+
+engine:
+  gpus: [0, 1, 2, 3]
+  batch_size: 8
+  log_interval: 1000
+
+eval_metric: f1_max
+lr_ratio: 0.0
+
+model_checkpoint: {{ ckpt }}
+train_all_layers: True
+
+checkpoint_path: '/shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_go'
+evaluation_path_test: '/shared/nas2/anna19/protein/early_exit/results/metrics/bert_go_evaluation_test'
+evaluation_path_valid: '/shared/nas2/anna19/protein/early_exit/results/metrics/bert_go_evaluation_valid'
+train:
+  num_epoch: 50

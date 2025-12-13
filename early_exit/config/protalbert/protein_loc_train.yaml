@@ -1,0 +1,48 @@
+output_dir: ~/scratch/anna19/protein_output
+
+dataset:
+  class: SubcellularLocalization
+  path: ~/scratch/anna19/subcell_localization/
+  atom_feature: null
+  bond_feature: null
+  transform:
+    class: Compose
+    transforms:
+      - class: TruncateProtein
+        max_length: 550
+        random: True
+      - class: ProteinView
+        view: "residue"
+
+task:
+  class: PropertyPredictionAllLayers
+  model:
+    class: CustomProtAlbert
+    #path: {{ modeldir }}
+    model: "CustomProtAlbert"
+  criterion: ce
+  metric: ["acc", "mcc"]
+  num_mlp_layer: 2
+  num_class: 10
+
+eval_metric: accuracy
+
+optimizer:
+  class: Adam
+  lr: 5.0e-5
+
+engine:
+  gpus: [0, 1, 2, 3]
+  batch_size: 4
+  gradient_interval: 4
+
+lr_ratio: 0
+
+train:
+  num_epoch: 50
+
+train_all_layers: True
+
+checkpoint_path: '/shared/nas2/anna19/protein/early_exit/results/model_checkpoints/albert_cl'
+evaluation_path_test: '/shared/nas2/anna19/protein/early_exit/results/metrics/albert_cl_evaluation_test'
+evaluation_path_valid: '/shared/nas2/anna19/protein/early_exit/results/metrics/albert_cl_evaluation_valid'

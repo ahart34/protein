@@ -41,11 +41,10 @@ lr_ratio: 0.0
 
 model_checkpoint: {{ ckpt }}
 train_all_layers: True
-load_weights_only: True
-checkpoint_path: /shared/nas2/anna19/early_exit/esm-s/model_checkpoints_protbert_2/ec/
-evaluation_path_valid: /shared/nas2/anna19/early_exit/esm-s/results_protbert_2/ec_regular_valid_protbert.pkl
-evaluation_path_test: /shared/nas2/anna19/early_exit/esm-s/results_protbert_2/ec_regular_test_protbert.pkl
 
+checkpoint_path: '/shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ec'
+evaluation_path_test: '/shared/nas2/anna19/protein/early_exit/results/metrics/bert_ec_evaluation_test'
+evaluation_path_valid: '/shared/nas2/anna19/protein/early_exit/results/metrics/bert_ec_evaluation_valid'
 
 train:
   num_epoch: 50
