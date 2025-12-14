@@ -71,7 +71,8 @@ def all_models(sequence_file, model_name, attn_dir):
         i+=1
 
 def main(args):
-    for model in ["Rostlab/prot_bert", "Rostlab/prot_albert", "Rostlab/prot_t5_xl_bfd", "Rostlab/prot_t5_xl_uniref50", "Rostlab/prot_xlnet", "esm"]:
+    #for model in ["Rostlab/prot_bert", "Rostlab/prot_albert", "Rostlab/prot_t5_xl_bfd", "Rostlab/prot_t5_xl_uniref50", "Rostlab/prot_xlnet", "esm"]:
+    for model in ["Rostlab/prot_t5_xl_bfd", "Rostlab/prot_t5_xl_uniref50", "Rostlab/prot_xlnet", "esm"]:
         print(f"processing model {model}")
         model_dirname = model.replace("/", "_")
         attn_dir = os.path.join(args.attn_dir, model_dirname)
