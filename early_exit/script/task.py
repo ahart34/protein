@@ -19,6 +19,17 @@ import math
 import numpy as np
 from transformers import AutoTokenizer, AlbertModel
 import torch.nn as nn
+from evaluation_runner import (
+    EarlyExitRunner, ExitPolicy,
+    ProtBERTAdapter, ESMAdapter, ProtAlbertAdapter,
+    HeadAdapter, SoftmaxHeadAdapter,
+)
+
+def graphs_to_sequences(graphs, data):
+    return [
+        "".join(data.Protein.id2residue_symbol[r] for r in g.residue_type.tolist())
+        for g in graphs
+    ]
 
 
 class MLP(nn.Module):
