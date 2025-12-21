@@ -134,32 +134,6 @@ def variance_confidence_interval(variance_array, n, confidence=0.95):
         upper_bound = (dof * variance_array) / chi2_upper
         
         return (lower_bound, upper_bound)
-
-def compute_protein_variance(data_dict, axis):
-    proteins = list(data_dict.keys())
-    layers = list(data_dict[proteins[0]].keys())
-    num_proteins = len(proteins)
-    num_layers = len(layers)
-    num_heads = len(data_dict[proteins[0]][layers[0]])
-    data_array = np.zeros((num_proteins, num_layers, num_heads), dtype=float)
-    for i, p in enumerate(proteins):
-        for j, l in enumerate(layers):
-            head_list = data_dict[p].get(l, [])
-            data_array[i,j,:] = head_list
-    data_array = np.log(data_array)
-    num_segments = 10
-    segment_size = num_proteins // num_segments
-    segment_variances = []
-    for k in range(num_segments):
-        start = k*segment_size
-        end = (k + 1) * segment_size if k < num_segments - 1 else num_proteins
-        segment = data_array[start:end]
-        variance_proteins = np.var(segment, axis=axis, ddof=1).mean()
-        segment_variances.append(variance_proteins)
-    segment_variances = np.array(segment_variances)
-    mean_variance = segment_variances.mean()
-    std_variance = segment_variances.std(ddof=1)
-    return mean_variance, std_variance 
     
 
 
@@ -328,8 +302,8 @@ def main():
             y_axis=True
         )
 
-        compute_protein_variance(protein_data, args.stats_output, protein)
-        compute_protein_variance(nlp_data, args.stats_output, nlp)
+        compute_ratio_statistics(protein_data, args.stats_output, protein)
+        compute_ratio_statistics(nlp_data, args.stats_output, nlp)
 
 
 if __name__ == '__main__':
