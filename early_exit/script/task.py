@@ -1018,3 +1018,4 @@ class Property_Node_walltime_ProtBert(tasks.Task, core.Configurable):
             raise ValueError(f"Unknown metric `{m}`")
 
         return metric
+    
