@@ -1,0 +1,54 @@
+output_dir: ~/scratch/anna19/protein_output
+
+dataset:
+  class: SecondaryStructure
+  path: ~/scratch/anna19/ssp/
+  atom_feature: null
+  bond_feature: null
+  transform:
+    class: Compose
+    transforms:
+      - class: ProteinView
+        view: residue
+      - class: TruncateProtein
+        max_length: 550
+
+test_split: cb513
+
+task:
+  class: Property_Node_walltime_ProtBert
+  model:
+    class: CustomProtBert
+    #path: {{ modeldir }}
+    model: "CustomProtBert"
+  criterion: ce
+  metric: 'macro_acc'
+  num_mlp_layer: 2
+  num_class: 3
+
+
+optimizer:
+  class: Adam
+  lr: 2.0e-4
+
+scheduler:
+  class: ReduceLROnPlateau
+  factor: 0.6
+  patience: 5
+
+engine:
+  gpus: [0]
+  batch_size: 1
+  log_interval: 1000
+
+eval_metric: macro_acc
+freeze_model: True
+
+
+load_weights_only: True
+pretrained_mlp_load_property_bert: True
+num_layers: 30
+evaluate: True
+
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ssp/model_epoch52.pth
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ssp_eval.csv

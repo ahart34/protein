@@ -25,6 +25,8 @@ import util
 import dataset, task
 import glob
 import csv
+import pdb
+
 
 def train_and_validate_all_layers(cfg, solver, scheduler):
     print("training and validating all layers")
@@ -228,3 +230,27 @@ if __name__ == "__main__":
             dataset = core.Configurable.load_config_dict(cfg.dataset)
         solver, scheduler = util.build_downstream_solver(cfg, dataset)
         train_and_validate_all_layers(cfg, solver, scheduler)
+    elif cfg.get("evaluate"):
+        if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+            cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+            train_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+            valid_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
+            test_set = core.Configurable.load_config_dict(cfg.dataset)
+            dataset = (train_set, valid_set, test_set)
+        else:
+            dataset = core.Configurable.load_config_dict(cfg.dataset)
+        solver, scheduler = util.build_downstream_solver(cfg, dataset)
+        with open(cfg.get("result_file"), 'w') as f:
+            writer = csv.writer(f)
+            writer.writerow(["Layer", cfg.task.metric, "Time"])
+            for layer in range(0, int(cfg.get("num_layers"))):
+                os.environ["LAYER"] = str(layer)
+                times = time.time()
+                results = solver.evaluate("test")   
+                timef = time.time()   
+                timee = timef - times
+                metric = results[cfg.task.metric]  
+                writer.writerow([layer, metric, timee])
+                f.flush()

@@ -19,11 +19,6 @@ import math
 import numpy as np
 from transformers import AutoTokenizer, AlbertModel
 import torch.nn as nn
-from evaluation_runner import (
-    EarlyExitRunner, ExitPolicy,
-    ProtBERTAdapter, ESMAdapter, ProtAlbertAdapter,
-    HeadAdapter, SoftmaxHeadAdapter,
-)
 
 def graphs_to_sequences(graphs, data):
     return [
@@ -644,3 +639,382 @@ class NodePropertyPredictionAllLayers(tasks.Task, core.Configurable):
 
         return metric
 
+
+@R.register("tasks.Classification_walltime_ProtBert")
+class Classification_walltime_ProtBert(tasks.Task, core.Configurable):
+    def __init__(self, model, metric=('f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer):
+        """
+        Args:
+            model_checkpoint (str): Path to the saved model checkpoint.
+            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            confidence_classifier (nn.Module): Confidence classifier.
+            confidence_threshold (float): Threshold for early exit based on confidence.
+        """
+        super(Classification_walltime_ProtBert, self).__init__()
+        self.model = model  # Load the main model from checkpoint
+        self.metric = metric
+        self.tokenizer=tokenizer
+
+    # ------------- helper to space‑separate sequences ------------
+    @staticmethod
+    def _prep_protbert(seqs):               # EDIT: name
+        cleaned = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            cleaned.append(" ".join(list(s)))
+        return cleaned
+
+    # --------------------------- PREDICT -------------------------
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device).eval()        # ensure correct GPU
+        self.mlp.to(device).eval()
+
+        graphs = batch["graph"]
+
+        sequences = [
+            "".join(data.Protein.id2residue_symbol[r] for r in g.residue_type.tolist())
+            for g in graphs
+        ]
+        batch_size = len(sequences)
+
+        # ---- tokenise ----
+        prepared = self._prep_protbert(sequences)
+        enc = self.tokenizer(
+            prepared,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=1024,                # ProtBERT was trained up to 1024
+            return_tensors="pt",
+        )
+        input_ids      = enc["input_ids"     ].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+
+        # ---- temperatures / bookkeeping ----
+        n_layers = self.model.config.num_hidden_layers
+        layer_stop = int(os.getenv("LAYER"))
+
+        # ---- build extended attention mask like BERT does ----
+        ext_mask = (1.0 - attention_mask[:, None, None, :]) * -10000.0
+
+        # ---- initial embeddings ----
+        hs = self.model.embeddings(input_ids)
+
+        # ---- iterate through encoder layers (no weight sharing) ----
+        for layer_idx, layer in enumerate(self.model.encoder.layer):     # EDIT: simple loop
+            # BERT layer forward
+            out = layer(
+                hs,
+                attention_mask=ext_mask,
+                head_mask=None,
+                output_attentions=False
+            )
+            hs = out[0]                 # first element is hidden states
+
+            if layer_idx == layer_stop:
+            # ---------- classifier ----------
+                pooled   = hs.mean(dim=1)
+                final_logits   = self.mlp[layer_idx](pooled)
+                break
+
+        return {
+            "pred": final_logits,
+        }
+
+    # ------------- unchanged target / evaluate -----------------
+    def target(self, batch):
+        return batch["targets"]
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        if isinstance(self.metric, dict):
+            m = list(self.metric.keys())
+        else:
+            m = self.metric
+
+        if m == "auroc@micro":
+            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+        elif m == "auprc@micro":
+            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+        elif m == "f1_max":
+            score = metrics.f1_max(pred, target)
+        elif m == "acc" or "acc" in m:
+            m = "acc"
+            score = []
+            num_class = 0
+            for i, cur_num_class in enumerate(self.num_class):
+                _pred = pred[:, num_class:num_class + cur_num_class]
+                _target = target[:, i]
+                _labeled = labeled[:, i]
+                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                score.append(_score)
+                num_class += cur_num_class
+            score = torch.stack(score)
+        else:
+            raise ValueError(f"Unknown metric {m}")
+        metric_out[m] = score.item()
+        return metric_out
+
+@R.register("tasks.Property_walltime_ProtBert")
+class Property_walltime_ProtBert(Classification_walltime_ProtBert):
+    eps = 1e-10
+    _option_members = {"task", "criterion", "metric"}
+
+    def __init__(self, model, task=(), metric=("acc"), criterion="mse", num_mlp_layer=2, #switched to 2
+                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0):
+        super().__init__(model=model, metric=metric, verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer)
+        self.model = model
+        self.task = task
+        self.criterion = criterion
+        self.num_mlp_layer = num_mlp_layer
+        # For classification tasks, we disable normalization tricks.
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_class = (num_class,) if isinstance(num_class, int) else num_class
+        self.num_layers = model.num_layers
+        self.mlp_batch_norm = mlp_batch_norm
+        self.mlp_dropout = mlp_dropout
+        self.graph_construction_model = graph_construction_model
+        self.verbose = verbose
+        self.confidence_threshold = confidence_threshold
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def target(self, batch):
+        target = torch.stack([batch[t].float() for t in self.task], dim=-1)
+        labeled = batch.get("labeled", torch.ones(len(target), dtype=torch.bool, device=target.device))
+        target[~labeled] = math.nan
+        return target
+    
+@R.register("tasks.Property_Node_walltime_ProtBert")
+class Property_Node_walltime_ProtBert(tasks.Task, core.Configurable):
+    _option_members = {"criterion"}
+
+    def __init__(
+        self,
+        model,
+        criterion="bce",
+        metric=("macro_acc"),
+        num_mlp_layer=1,
+        normalization=True,
+        num_class=None,
+        verbose=0,
+    ):
+        super(Property_Node_walltime_ProtBert, self).__init__()
+        self.model = model
+        self.criterion = criterion
+        self.metric = metric
+        # For classification tasks, disable normalization
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_mlp_layer = num_mlp_layer
+        self.num_class = num_class
+        self.verbose = verbose
+        self.num_layers = 33
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+
+    @staticmethod
+    def _prep_protbert(seqs):
+        """Space‑separate, upper‑case, map U/O→X (ProtBERT convention)."""
+        out = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            out.append(" ".join(list(s)))
+        return out
+
+    def preprocess(self, train_set, valid_set, test_set):
+        """
+        Compute mean, std, and num_class on the training set,
+        then build an MLP head per layer.
+        """
+        # Determine whether we are working at the node, atom, or residue level
+        self.view = getattr(train_set[0]["graph"], "view", "atom")
+
+        # Collect all target values from the train set for statistics
+        values_list = []
+        for data in train_set:
+            values_list.append(data["graph"].target)  # shape: (num_nodes,) or (num_residues,)
+
+        values = torch.cat(values_list, dim=0)
+        mean = values.float().mean()
+        std = values.float().std()
+
+        # Figure out number of classes if doing classification
+        num_class = 1
+        if values.dtype == torch.long:
+            # If max label is >1 or not using BCE, it means multiclass
+            nmax = values.max().item()
+            if nmax > 1 or "bce" not in self.criterion:
+                nmax += 1
+            num_class = nmax
+
+        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float))
+        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float))
+        self.num_class = self.num_class or num_class
+
+    def predict(self, batch, all_loss=None, metric=None):
+        """
+        Forward the batch through ProtBERT up to `last_layer`
+        (taken from the env-var LAYER).  Return per-residue logits
+        from that layer only.
+
+        Returns
+        -------
+        dict
+            {"pred": final_logits}
+        """
+        # -----------------------------------------------------------
+        # 0) set-up
+        # -----------------------------------------------------------
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device).eval()
+        self.mlp.to(device).eval()
+
+        # -----------------------------------------------------------
+        # 1) graphs → raw sequences
+        # -----------------------------------------------------------
+        graphs = batch["graph"]
+        sequences = [
+            "".join(data.Protein.id2residue_symbol[r] for r in g.residue_type.tolist())
+            for g in graphs
+        ]
+
+        # -----------------------------------------------------------
+        # 2) tokenise
+        # -----------------------------------------------------------
+        if not hasattr(self, "_tokenizer"):
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                "Rostlab/prot_bert",
+                do_lower_case=False,
+                use_fast=False,
+                cache_dir=os.getenv("HF_CACHE", "/scratch/anna19/hf_cache"),
+            )
+
+        enc = self._tokenizer(
+            self._prep_protbert(sequences),
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=1024,
+            return_tensors="pt",
+        ).to(device)
+        input_ids, attn_mask = enc["input_ids"], enc["attention_mask"]
+
+        # -----------------------------------------------------------
+        # 3) embeddings + bert-style mask
+        # -----------------------------------------------------------
+        hs = self.model.embeddings(input_ids)                 # (B,L,H)
+        ext_mask = (1.0 - attn_mask[:, None, None, :]) * -10000.0
+
+        # -----------------------------------------------------------
+        # 4) figure out which layer to stop at
+        # -----------------------------------------------------------
+        n_layers = self.model.config.num_hidden_layers
+        env_val   = os.getenv("LAYER", str(n_layers - 1))     # default = last layer
+        last_layer = int(float(env_val))                      # allow "3" or "3.0"
+
+        if not (0 <= last_layer < n_layers):
+            raise ValueError(f"LAYER={last_layer} out of range (0-{n_layers-1})")
+
+        # -----------------------------------------------------------
+        # 5) forward only up to that layer
+        # -----------------------------------------------------------
+        with torch.no_grad():
+            for lidx, layer in enumerate(self.model.encoder.layer):
+                hs = layer(
+                    hs,
+                    attention_mask=ext_mask,
+                    head_mask=None,
+                    output_attentions=False,
+                )[0]
+                if lidx == last_layer:
+                    break
+
+        # -----------------------------------------------------------
+        # 6) per-sample logits via the *same* layer’s MLP head
+        # -----------------------------------------------------------
+        final_logits = []
+        for b, seq in enumerate(sequences):
+            seq_len = len(seq)
+            h_i   = hs[b, 1 : seq_len + 1, :]      # drop [CLS]
+            log_i = self.mlp[last_layer](h_i)      # (L_res,C)
+            final_logits.append(log_i)
+
+        # -----------------------------------------------------------
+        # 7) return only what you asked for
+        # -----------------------------------------------------------
+        return {"pred": final_logits}
+
+    def target(self, batch):
+        """
+        Return a dictionary with:
+        "label": the node-level target
+        "mask": a boolean mask indicating which nodes are labeled
+        "size": used for some metrics requiring per-graph aggregates
+        """
+        graph = batch["graph"]
+        size = graph.num_nodes if self.view in ["node", "atom"] else graph.num_residues
+        return {
+            "label": graph.target,   # shape: (num_nodes,) or (num_residues,)
+            "mask": graph.mask,      # shape: (num_nodes,) or (num_residues,)
+            "size": size
+        }
+
+    def evaluate(self, preds, target):
+        """
+        Evaluate each layer's predictions given the `target`.
+        preds: list of tensors, each is shape (N, num_class) or (N,) depending on your MLP output
+        target: dict with { "label", "mask", "size" }
+        """
+        metric = {}
+        _target = target["label"]
+        _mask = target["mask"]
+        labeled = ~torch.isnan(_target) & _mask
+        _size = functional.variadic_sum(labeled.long(), target["size"])
+        pred = preds["pred"]
+
+        device = pred.device if hasattr(pred, 'device') else (
+        pred["pred"].device if isinstance(pred, dict) and "pred" in pred else 
+        (pred[0].device if isinstance(pred, list) and len(pred) > 0 else torch.device("cpu"))
+        )
+
+        # Move target to the same device as pred
+        _target = _target.to(device)
+        labeled = labeled.to(device)
+        _size = _size.to(device)
+
+        if isinstance(self.metric, dict):
+            m = list(self.metric.keys())
+        elif isinstance(self.metric, (list, tuple)):
+            m = list(self.metric)
+        else:
+            m = self.metric
+
+        if m == "macro_acc":
+            pred = torch.cat(pred, dim=0)
+            pred_argmax = pred[labeled].argmax(dim=-1)
+            correct = (pred_argmax == _target[labeled]).float()
+            score = functional.variadic_mean(correct, _size).mean()
+            metric["macro_acc"] = score.item()
+
+        else:
+            raise ValueError(f"Unknown metric `{m}`")
+
+        return metric
