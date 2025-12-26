@@ -1198,6 +1198,238 @@ class EarlyExitClassification_walltime_ProtBert(tasks.Task, core.Configurable):
         result[m] = metric_out[m]
         return result
 
+@R.register("tasks.EarlyExitProperty_continuous_protbert")
+class EarlyExitProperty_continuous_protbert(tasks.Task, core.Configurable):
+    eps = 1e-10
+    _option_members = {"task", "criterion", "metric"}
+
+    def __init__(self, model, task=(), criterion="mse", metric=("mae", "rmse"), num_mlp_layer=2, #switched to 2
+                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0):
+        super(EarlyExitProperty_continuous_protbert, self).__init__()
+        self.model = model
+        self.task = task
+        self.criterion = criterion
+        self.metric = metric
+        self.num_mlp_layer = num_mlp_layer
+        # For classification tasks, we disable normalization tricks.
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_class = (num_class,) if isinstance(num_class, int) else num_class
+        self.num_layers = model.num_layers
+        self.mlp_batch_norm = mlp_batch_norm
+        self.mlp_dropout = mlp_dropout
+        self.graph_construction_model = graph_construction_model
+        self.verbose = verbose
+        self.confidence_threshold = confidence_threshold
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+
+    @staticmethod
+    def _prep_protbert(seqs):
+        """Space‑separate, upper‑case, map U/O→X (ProtBERT convention)."""
+        out = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            out.append(" ".join(list(s)))
+        return out
+
+    def predict(self, batch, all_loss=None, metric=None):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device).eval()        # ensure correct GPU
+        self.mlp.to(device).eval()
+        #print(f"device {device}")
+        graphs  = batch["graph"]
+
+        # ---- graphs → raw sequences -------------------------------------
+        seqs = ["".join(data.Protein.id2residue_symbol[r] for r in g.residue_type.tolist())
+                for g in graphs]
+        B = len(seqs)
+
+        # ---- temperatures / threshold ------------------------------------
+        thr = float(os.getenv("THRESHOLD", "0.0"))
+        tmp_file = os.getenv("TEMPERATURE_FILE")
+        if tmp_file and tmp_file.lower() != "none":
+            temps = torch.tensor(self._extract_temperatures(tmp_file), device=device)
+        else:
+            temps = torch.ones(self.num_layers, device=device)
+
+        # ---- tokenizer ----------------------------------------------------
+        if not hasattr(self, "_tokenizer"):
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                "Rostlab/prot_bert", do_lower_case=False, use_fast=False,
+                cache_dir=os.getenv("HF_CACHE", "/scratch/anna19/hf_cache")
+            )
+        enc = self._tokenizer(
+            self._prep_protbert(seqs),
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=1024,
+            return_tensors="pt"
+        ).to(device)
+        input_ids, attn_mask = enc["input_ids"], enc["attention_mask"]
+
+        # ---- initial embeddings ------------------------------------------
+        hs = self.model.embeddings(input_ids)                 # (B,L,H)
+        ext_mask = (1.0 - attn_mask[:, None, None, :]) * -10000.0
+
+        # ---- bookkeeping -------------------------------------------------
+        final_log = [None] * B
+        final_lay = [None] * B
+        best_prob = torch.full((B,), -float("inf"), device=device)
+        best_log  = [None] * B
+        best_lay  = [None] * B
+        computed_layers = [None] * B 
+        active    = torch.arange(B, device=device)
+         # ---- iterate through 30 encoder layers (no sharing) --------------
+        for lidx, layer in enumerate(self.model.encoder.layer):
+            if active.numel() == 0:
+                break
+            for idx in active.tolist():
+                computed_layers[idx] = lidx 
+            # forward only for still‑active samples
+            hs_act = layer(
+                hs[active],
+                attention_mask=ext_mask[active],
+                head_mask=None,
+                output_attentions=False
+            )[0]
+            hs[active] = hs_act
+
+            # task head
+            pooled = hs_act.mean(dim=1)
+            logits = self.mlp[lidx](pooled)
+            prob   = torch.sigmoid(logits / temps[lidx])
+            max_p  = prob.max(dim=1).values
+
+            # best‑so‑far update
+            is_final = lidx == self.num_layers - 1
+            better   = max_p > best_prob[active]
+            if is_final and os.getenv("SELECT_LAST", "False") == "True":
+                better = torch.ones_like(better, dtype=torch.bool)
+            if better.any():
+                gi = active[better]
+                best_prob[gi] = max_p[better]
+                for k, gidx in enumerate(gi.tolist()):
+                    best_log[gidx] = logits[better][k]
+                    best_lay[gidx] = lidx
+
+            # early‑exit decision
+            exit_mask = max_p > thr
+            newly_exit, still = active[exit_mask], active[~exit_mask]
+
+            for k, gidx in enumerate(newly_exit.tolist()):
+                final_log[gidx] = logits[exit_mask][k]
+                final_lay[gidx] = lidx
+
+            active = still
+
+        # ---- force‑exit leftovers ----------------------------------------
+        for gidx in active.tolist():
+            final_log[gidx] = best_log[gidx]
+            final_lay[gidx] = best_lay[gidx]
+
+        preds = torch.stack(final_log, dim=0)                 # (B,C)
+
+        # legacy 2000‑wide ASCII tensor
+        ascii_mat = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor([ord(c) for c in s], device=device) for s in seqs],
+            batch_first=True, padding_value=0
+        )
+        if ascii_mat.size(1) < 2000:
+            ascii_mat = torch.cat(
+                [ascii_mat, ascii_mat.new_zeros(B, 2000 - ascii_mat.size(1))],
+                dim=1
+            )
+
+        return {
+            "pred": preds,
+            "layers": torch.tensor(final_lay, device=device, dtype=torch.int64),
+            "sequences": ascii_mat, 
+            "computed_layers":torch.tensor(computed_layers, device=self.device, dtype=torch.int64)
+        }
+
+ 
+    def target(self, batch):
+        target = torch.stack([batch[t].float() for t in self.task], dim=-1)
+        labeled = batch.get("labeled", torch.ones(len(target), dtype=torch.bool, device=target.device))
+        target[~labeled] = math.nan
+        return target
+
+    def evaluate(self, preds, target):
+        pred = preds["pred"]
+        layers = preds["layers"]
+        sequences = preds["sequences"]
+        print(f"{pred.shape} pred.shape")
+        print(f"self.num class {self.num_class}")
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        target = target.to(device)
+        labeled = ~torch.isnan(target)
+        metric = {}
+        for _metric in self.metric:
+            if _metric == "auroc@micro":
+                score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+            elif _metric == "auprc@micro":
+                score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+            elif _metric == "f1_max":
+                score = metrics.f1_max(pred, target)
+            elif _metric == "acc":
+                score = []
+                num_class = 0
+                for i, cur_num_class in enumerate(self.num_class):
+                    _pred = pred[:, num_class:num_class + cur_num_class]
+                    _target = target[:, i]
+                    _labeled = labeled[:, i]
+                    _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                    score.append(_score)
+                    num_class += cur_num_class
+                score = torch.stack(score)
+                acc = score.item()
+                metric["acc"] = acc
+            else:
+                raise ValueError("Unknown criterion `%s`" % _metric)
+
+        
+        layer_frequencies = torch.bincount(layers)
+        total = layer_frequencies.sum()
+        layer_indices = torch.arange(len(layer_frequencies), device=layer_frequencies.device)
+        average_layer = (layer_indices * layer_frequencies).sum() / total
+        metric["avg_layer"] = average_layer
+
+        computed_layers = preds["computed_layers"]
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+        metric["avg_computed_layer"] = average_computed_layer.item()
+
+        # results_pickle = os.getenv("RESULT_PICKLE")
+        # results = {"preds": pred, "target": target, "layers": layers, "avg_computed_layer": average_computed_layer.item(), "metric": metric, "sequences": sequences}
+
+        # with open(results_pickle, 'wb') as f:
+        #     pickle.dump(results, f)
+
+        return metric
+
+
+
+
+
+
+
+
 
 @R.register("tasks.EarlyExitClassificationTemperature_Node_continuous_ProtBert")
 class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, core.Configurable):
@@ -1223,18 +1455,6 @@ class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, co
         self.num_class = num_class
         self.verbose = verbose
         self.num_layers = 33
-
-    def extract_temperatures(self, file_path):
-        temperatures = []
-        with open(file_path, 'r') as csvfile:
-            reader = csv.reader(csvfile)
-            next(reader)  # Skip the header row
-            for row in reader:
-                # Extract the tensor value from the second column and parse the float
-                tensor_string = row[1]
-                value = float(tensor_string.split('(')[1].split(',')[0])
-                temperatures.append(value)
-        return temperatures
 
     @staticmethod
     def _prep_protbert(seqs):
@@ -1298,16 +1518,11 @@ class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, co
         # ---------------------------------------------------------------
         # 1) temperatures / thresholds
         # ---------------------------------------------------------------
-        threshold = float(os.getenv("CFG_THRESHOLD"))
+        threshold = float(os.getenv("THRESHOLD"))
         percent   = float(os.getenv("PERCENT"))
 
-        tmp_file = os.getenv("TEMPERATURE_FILE")
-        if tmp_file and tmp_file.lower() != "none":
-            temps = torch.tensor(self.extract_temperatures(tmp_file), device=device)
-        else:
-            # number of encoder layers (30 for ProtBERT‑B)
-            n_layers = getattr(self, "num_layers", self.model.config.num_hidden_layers)
-            temps = torch.ones(n_layers, device=device)
+        n_layers = getattr(self, "num_layers", self.model.config.num_hidden_layers)
+        temps = torch.ones(n_layers, device=device)
 
         # ---------------------------------------------------------------
         # 2) tokenize with ProtBERT tokenizer (slow‑tokenizer, no lower‑case)
@@ -1392,7 +1607,7 @@ class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, co
 
             if still_active.numel() > 0:
                 better = max_prob_vec[~done_mask] > best_prob[still_active]
-                if is_final and os.getenv("SELECT_LAST", "False") == "True":
+                if is_final and os.getenv("SELECT_LAST") == "True":
                     better = torch.ones_like(better, dtype=torch.bool)
 
                 if better.any():
@@ -1513,14 +1728,20 @@ class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, co
 
         result = {}
 
-        with open(os.getenv("RESULT_PICKLE"), "wb") as f:
-            pickle.dump(
-                {"preds": pred, "target": target, "layers": layers, "avg_computed_layer": average_computed_layer,
-                 "metric": metric[_metric], "sequences": preds["sequences"]}, f
-            )
+        # with open(os.getenv("RESULT_PICKLE"), "wb") as f:
+        #     pickle.dump(
+        #         {"preds": pred, "target": target, "layers": layers, "avg_computed_layer": average_computed_layer,
+        #          "metric": metric[_metric], "sequences": preds["sequences"]}, f
+        #     )
 
         result["avg_layer"] = average_layer.item()
         result["avg_computed_layer"] = average_computed_layer.item()
-        result[_metricm] = metric_out[m]
-        result.update(metric_out[m].item())
+        result["macro_acc"] = metric["macro_acc"]
         return result
+
+
+
+##############################################################
+### ESM ###
+##############################################################
+
