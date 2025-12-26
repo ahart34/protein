@@ -1019,3 +1019,508 @@ class Property_Node_walltime_ProtBert(tasks.Task, core.Configurable):
 
         return metric
     
+
+@R.register("tasks.EarlyExitClassification_walltime_ProtBert")
+class EarlyExitClassification_walltime_ProtBert(tasks.Task, core.Configurable):
+    def __init__(self, model, metric=('f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer):
+        """
+        Args:
+            model_checkpoint (str): Path to the saved model checkpoint.
+            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            confidence_classifier (nn.Module): Confidence classifier.
+            confidence_threshold (float): Threshold for early exit based on confidence.
+        """
+        super(EarlyExitClassification_walltime_ProtBert, self).__init__()
+        self.model = model  # Load the main model from checkpoint
+        self.metric = metric
+        self.tokenizer=tokenizer
+
+    # ------------- helper to space‑separate sequences ------------
+    @staticmethod
+    def _prep_protbert(seqs):               # EDIT: name
+        cleaned = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            cleaned.append(" ".join(list(s)))
+        return cleaned
+
+    # --------------------------- PREDICT -------------------------
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device).eval()        # ensure correct GPU
+        self.mlp.to(device).eval()
+
+        graphs = batch["graph"]
+
+        sequences = [
+            "".join(data.Protein.id2residue_symbol[r] for r in g.residue_type.tolist())
+            for g in graphs
+        ]
+        batch_size = len(sequences)
+
+        # ---- tokenise ----
+        prepared = self._prep_protbert(sequences)
+        enc = self.tokenizer(
+            prepared,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=1024,                # ProtBERT was trained up to 1024
+            return_tensors="pt",
+        )
+        input_ids      = enc["input_ids"     ].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+
+        # ---- temperatures / bookkeeping ----
+        n_layers = self.model.config.num_hidden_layers
+        temps    = torch.ones(n_layers, device=device)
+        threshold = float(os.getenv("THRESHOLD", "0.0"))
+
+        final_logits = [None] * batch_size
+        final_layers = [None] * batch_size
+        best_prob    = torch.full((batch_size,), -float("inf"), device=device)
+        best_logits  = [None] * batch_size
+        best_layers  = [None] * batch_size
+        computed_layers = [None] * batch_size  
+        active       = torch.arange(batch_size, device=device)
+
+        # ---- build extended attention mask like BERT does ----
+        ext_mask = (1.0 - attention_mask[:, None, None, :]) * -10000.0
+
+        # ---- initial embeddings ----
+        hs = self.model.embeddings(input_ids)
+
+        # ---- iterate through encoder layers (no weight sharing) ----
+        for layer_idx, layer in enumerate(self.model.encoder.layer):     # EDIT: simple loop
+            if len(active) == 0:
+                break
+            for idx in active.tolist():
+                computed_layers[idx] = layer_idx
+
+            # slice to active samples only
+            hs_active = hs[active]
+
+            # BERT layer forward
+            out = layer(
+                hs_active,
+                attention_mask=ext_mask[active],
+                head_mask=None,
+                output_attentions=False
+            )
+            hs_active = out[0]                 # first element is hidden states
+            hs[active] = hs_active
+
+            # ---------- classifier ----------
+            pooled   = hs_active.mean(dim=1)
+            logits   = self.mlp[layer_idx](pooled)
+            prob     = torch.sigmoid(logits / temps[layer_idx])
+            max_p, _ = prob.max(dim=1)
+
+            # ---------- best‑so‑far ----------
+            is_final = layer_idx == n_layers - 1
+            better   = max_p > best_prob[active]
+            if is_final and os.getenv("SELECT_LAST") == "True":
+                better = torch.ones_like(better, dtype=torch.bool)
+
+            if better.any():
+                g_idx = active[better]
+                best_prob[g_idx] = max_p[better]
+                for j, gi in enumerate(g_idx.tolist()):
+                    best_logits[gi] = logits[better][j]
+                    best_layers[gi] = layer_idx
+
+            # ---------- early‑exit ----------
+            exit_mask  = max_p > threshold
+            newly_exit = active[exit_mask]
+            still_act  = active[~exit_mask]
+
+            for j, gi in enumerate(newly_exit.tolist()):
+                final_logits[gi] = logits[exit_mask][j]
+                final_layers[gi] = layer_idx
+
+            active = still_act
+
+        # ---- force exit any stragglers ----
+        for gi in active.tolist():
+            final_logits[gi] = best_logits[gi]
+            final_layers[gi] = best_layers[gi]
+
+        preds = torch.stack(final_logits, dim=0)
+
+        # legacy 2000‑wide ascii tensor (unchanged)
+        ascii_mat = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor([ord(c) for c in s], device=device) for s in sequences],
+            batch_first=True, padding_value=0,
+        )
+        if ascii_mat.size(1) < 2000:
+            pad = ascii_mat.new_zeros(ascii_mat.size(0), 2000 - ascii_mat.size(1))
+            ascii_mat = torch.cat([ascii_mat, pad], dim=1)
+
+        return {
+            "pred": preds,
+            "layers": torch.tensor(final_layers, device=device, dtype=torch.int64),
+            "computed_layers":torch.tensor(computed_layers, device=self.device, dtype=torch.int64),
+            "sequences": ascii_mat,
+        }
+
+    # ------------- unchanged target / evaluate -----------------
+    def target(self, batch):
+        return batch["targets"]
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        layers = preds["layers"]
+        computed_layers = preds["computed_layers"]
+        sequences = preds["sequences"]
+        target = target.to(pred.device)
+
+        metric_out = {}
+        m = self.metric
+        if m == "f1_max":
+            score = metrics.f1_max(pred, target)
+            metric_out[m] = score.item()
+        else:
+            raise ValueError(f"Unknown metric {m}")
+
+        freq = torch.bincount(layers.cpu())
+        avg_layer = (torch.arange(len(freq), device=freq.device) * freq).sum() / freq.sum()
+
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+
+
+        result["avg_layer"] = avg_layer.item()
+        result["avg_computed_layer"] = average_computed_layer.item()
+        result[m] = metric_out[m]
+        return result
+
+
+@R.register("tasks.EarlyExitClassificationTemperature_Node_continuous_ProtBert")
+class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, core.Configurable):
+    _option_members = {"criterion", "metric"}
+
+    def __init__(
+        self,
+        model,
+        criterion="bce",
+        metric=("macro_auprc", "macro_auroc"),
+        num_mlp_layer=1,
+        normalization=True,
+        num_class=None,
+        verbose=0,
+    ):
+        super(EarlyExitClassificationTemperature_Node_continuous_ProtBert, self).__init__()
+        self.model = model
+        self.criterion = criterion
+        self.metric = metric
+        # For classification tasks, disable normalization
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_mlp_layer = num_mlp_layer
+        self.num_class = num_class
+        self.verbose = verbose
+        self.num_layers = 33
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+
+    @staticmethod
+    def _prep_protbert(seqs):
+        """Space‑separate, upper‑case, map U/O→X (ProtBERT convention)."""
+        out = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            out.append(" ".join(list(s)))
+        return out
+
+    def preprocess(self, train_set, valid_set, test_set):
+        """
+        Compute mean, std, and num_class on the training set,
+        then build an MLP head per layer.
+        """
+        # Determine whether we are working at the node, atom, or residue level
+        self.view = getattr(train_set[0]["graph"], "view", "atom")
+
+        # Collect all target values from the train set for statistics
+        values_list = []
+        for data in train_set:
+            values_list.append(data["graph"].target)  # shape: (num_nodes,) or (num_residues,)
+
+        values = torch.cat(values_list, dim=0)
+        mean = values.float().mean()
+        std = values.float().std()
+
+        # Figure out number of classes if doing classification
+        num_class = 1
+        if values.dtype == torch.long:
+            # If max label is >1 or not using BCE, it means multiclass
+            nmax = values.max().item()
+            if nmax > 1 or "bce" not in self.criterion:
+                nmax += 1
+            num_class = nmax
+
+        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float))
+        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float))
+        self.num_class = self.num_class or num_class
+
+    def predict(self, batch, all_loss=None, metric=None):
+        """
+        Same inputs/outputs as the original ESM‑2 version, but revised to use
+        ProtBERT.  The overall control‑flow, early‑exit logic, and return
+        structure are unchanged so downstream code keeps working.
+        """
+        # ---------------------------------------------------------------
+        # 0) bookkeeping & set‑up
+        # ---------------------------------------------------------------
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model.to(device).eval()
+        self.mlp.to(device).eval()
+
+        graphs = batch["graph"]
+        sequences = [
+            "".join(data.Protein.id2residue_symbol[r] for r in g.residue_type.tolist())
+            for g in graphs
+        ]
+        B = len(sequences)
+
+        # ---------------------------------------------------------------
+        # 1) temperatures / thresholds
+        # ---------------------------------------------------------------
+        threshold = float(os.getenv("CFG_THRESHOLD"))
+        percent   = float(os.getenv("PERCENT"))
+
+        tmp_file = os.getenv("TEMPERATURE_FILE")
+        if tmp_file and tmp_file.lower() != "none":
+            temps = torch.tensor(self.extract_temperatures(tmp_file), device=device)
+        else:
+            # number of encoder layers (30 for ProtBERT‑B)
+            n_layers = getattr(self, "num_layers", self.model.config.num_hidden_layers)
+            temps = torch.ones(n_layers, device=device)
+
+        # ---------------------------------------------------------------
+        # 2) tokenize with ProtBERT tokenizer (slow‑tokenizer, no lower‑case)
+        # ---------------------------------------------------------------
+        if not hasattr(self, "_tokenizer"):
+            from transformers import AutoTokenizer
+            self._tokenizer = AutoTokenizer.from_pretrained(
+                "Rostlab/prot_bert", do_lower_case=False, use_fast=False,
+                cache_dir=os.getenv("HF_CACHE", "/scratch/anna19/hf_cache"),
+            )
+
+        enc = self._tokenizer(
+            self._prep_protbert(sequences),
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,
+            max_length=1024,
+            return_tensors="pt",
+        ).to(device)
+        input_ids, attn_mask = enc["input_ids"], enc["attention_mask"]  # (B,L)
+
+        # ---------------------------------------------------------------
+        # 3) initial embeddings (B,L,H) and Bert‑style attention mask
+        # ---------------------------------------------------------------
+        hs = self.model.embeddings(input_ids)                               # (B,L,H)
+        ext_mask = (1.0 - attn_mask[:, None, None, :]) * -10000.0          # (B,1,1,L)
+
+        # ---------------------------------------------------------------
+        # 4) placeholders for results & trackers (match original output)
+        # ---------------------------------------------------------------
+        final_logits = [None] * B
+        final_layers = torch.full((B,), -1, device=device)
+        best_logits  = [None] * B
+        best_prob    = torch.full((B,), -float("inf"), device=device)
+        best_layers  = torch.full((B,), -1, device=device)
+        computed_layers = torch.full((B,), -1, device=device) 
+        active       = torch.arange(B, device=device)
+
+        n_layers = getattr(self, "num_layers", self.model.config.num_hidden_layers)
+
+        # ---------------------------------------------------------------
+        # 5) iterate over ProtBERT encoder layers
+        # ---------------------------------------------------------------
+        for lidx, layer in enumerate(self.model.encoder.layer):
+            if active.numel() == 0:
+                break
+            for idx in active.tolist():
+                computed_layers[idx] = lidx 
+
+            # ---- forward pass ONLY for active samples -----------------
+            hs_act = layer(
+                hs[active],                   # (A,L,H)
+                attention_mask=ext_mask[active],
+                head_mask=None,
+                output_attentions=False,
+            )[0]
+            hs[active] = hs_act               # write‑back
+
+            # ---- MLP head per sample ----------------------------------
+            logits_list = []
+            max_prob_vec = torch.empty(active.size(0), device=device)
+
+            for loc, gidx in enumerate(active.tolist()):
+                seq_len = len(sequences[gidx])
+                # slice off the [CLS] token at pos 0; keep only residues
+                h_i = hs_act[loc, 1 : seq_len + 1, :]      # (L_res,H)
+                log_i = self.mlp[lidx](h_i)                # (L_res,C)
+                logits_list.append(log_i)
+
+                probs = torch.sigmoid(log_i / temps[lidx])
+                max_prob_vec[loc] = probs.max(dim=1).values.mean()
+
+                if (probs.max(dim=1).values > threshold).float().mean() >= percent:
+                    final_logits[gidx] = log_i
+                    final_layers[gidx] = lidx
+
+            # ---- split finished vs. still active ----------------------
+            done_mask   = final_layers[active] != -1
+            newly_done  = active[done_mask]
+            still_active = active[~done_mask]
+            is_final    = lidx == n_layers - 1
+
+            if still_active.numel() > 0:
+                better = max_prob_vec[~done_mask] > best_prob[still_active]
+                if is_final and os.getenv("SELECT_LAST", "False") == "True":
+                    better = torch.ones_like(better, dtype=torch.bool)
+
+                if better.any():
+                    upd_idx = still_active[better]
+                    best_prob[upd_idx]   = max_prob_vec[~done_mask][better]
+                    best_layers[upd_idx] = lidx
+                    # map local → global for logits list
+                    for k, g in enumerate(upd_idx.tolist()):
+                        best_logits[g] = logits_list[(~done_mask).nonzero(as_tuple=True)[0][k]]
+
+            active = still_active
+
+        # ---------------------------------------------------------------
+        # 6) force‑exit any leftovers -----------------------------------
+        for g in active.tolist():
+            final_logits[g] = best_logits[g]
+            final_layers[g] = best_layers[g]
+
+        # ---------------------------------------------------------------
+        # 7) legacy ASCII‑matrix (2000‑wide) ----------------------------
+        ascii_mat = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor([ord(c) for c in s], device=device) for s in sequences],
+            batch_first=True,
+            padding_value=0,
+        )
+        if ascii_mat.size(1) < 2000:
+            pad = ascii_mat.new_zeros(ascii_mat.size(0), 2000 - ascii_mat.size(1))
+            ascii_mat = torch.cat([ascii_mat, pad], dim=1)
+
+        return {
+            "pred": final_logits,               # list(Tensor[L_i,C])
+            "layers": final_layers,             # Tensor[B]
+            "sequences": ascii_mat,            # Tensor[B,2000]
+            "computed_layers":torch.tensor(computed_layers, device=self.device, dtype=torch.int64)
+        }
+
+    def target(self, batch):
+        """
+        Return a dictionary with:
+          "label": the node-level target
+          "mask": a boolean mask indicating which nodes are labeled
+          "size": used for some metrics requiring per-graph aggregates
+        """
+        graph = batch["graph"]
+        size = graph.num_nodes if self.view in ["node", "atom"] else graph.num_residues
+        return {
+            "label": graph.target,   # shape: (num_nodes,) or (num_residues,)
+            "mask": graph.mask,      # shape: (num_nodes,) or (num_residues,)
+            "size": size
+        }
+
+    def evaluate(self, preds, target):
+        """
+        Evaluate each layer's predictions given the `target`.
+        preds: list of tensors, each is shape (N, num_class) or (N,) depending on your MLP output
+        target: dict with { "label", "mask", "size" }
+        """
+        metric = {}
+        _target = target["label"]
+        _mask = target["mask"]
+        labeled = ~torch.isnan(_target) & _mask
+        _size = functional.variadic_sum(labeled.long(), target["size"])
+        pred = preds["pred"]
+
+        layers = preds["layers"]
+        layer_frequencies = torch.bincount(layers)
+        total = layer_frequencies.sum()
+        layer_indices = torch.arange(len(layer_frequencies), device=layer_frequencies.device)
+        average_layer = (layer_indices * layer_frequencies).sum() / total
+
+        for _metric in self.metric:
+            if _metric in ["mae", "rmse"]:
+                # Typically for regression
+                if _metric == "mae":
+                    score = F.l1_loss(pred, _target, reduction="none")
+                else:  # rmse
+                    score = F.mse_loss(pred, _target, reduction="none").sqrt()
+
+                score = functional.masked_mean(score, labeled, dim=0)
+
+            elif _metric in ["micro_auroc", "micro_auprc"]:
+                # Single "micro" approach across all labeled nodes
+                if _metric == "micro_auroc":
+                    score = metrics.area_under_roc(pred[labeled], _target[labeled])
+                else:
+                    score = metrics.area_under_prc(pred[labeled], _target[labeled])
+
+            elif _metric in ["macro_auroc", "macro_auprc"]:
+                # "macro" means compute per-graph, then average
+                if _metric == "macro_auroc":
+                    score = metrics.variadic_area_under_roc(pred[labeled], _target[labeled], _size).mean()
+                else:
+                    score = metrics.variadic_area_under_prc(pred[labeled], _target[labeled], _size).mean()
+
+            elif _metric == "macro_acc":
+                # One typical approach for multi-class:
+                # (pred[labeled].argmax(-1) == _target[labeled]).float()
+                #print(f"labeled.shape {labeled.shape}")
+                #print(f"target shape {_target.shape}")
+                #pred = torch.cat(pred, dim=0)
+                pred = torch.cat(pred, dim=0)
+                #print(f"pred.shape {pred.shape}")
+                pred_argmax = pred[labeled].argmax(dim=-1)
+                correct = (pred_argmax == _target[labeled]).float()
+                score = functional.variadic_mean(correct, _size).mean()
+                metric["macro_acc"] = score.item()
+
+            else:
+                raise ValueError(f"Unknown metric `{_metric}`")
+            metric["layer"] = average_layer.item()
+
+        computed_layers = preds["computed_layers"]
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+        metric["avg_computed_layer"] = average_computed_layer.item()
+
+        result = {}
+
+        with open(os.getenv("RESULT_PICKLE"), "wb") as f:
+            pickle.dump(
+                {"preds": pred, "target": target, "layers": layers, "avg_computed_layer": average_computed_layer,
+                 "metric": metric[_metric], "sequences": preds["sequences"]}, f
+            )
+
+        result["avg_layer"] = average_layer.item()
+        result["avg_computed_layer"] = average_computed_layer.item()
+        result[_metricm] = metric_out[m]
+        result.update(metric_out[m].item())
+        return result
