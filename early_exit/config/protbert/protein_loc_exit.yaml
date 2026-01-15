@@ -48,5 +48,5 @@ exit: True
 num_layers: 30
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/early_exit/esm-s/model_checkpoints_protbert_2/cl/model_epoch99.pth
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_cl/model_epoch89.pth
 result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_cl_exit.csv

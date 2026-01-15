@@ -1,0 +1,53 @@
+output_dir: ~/scratch/anna19/protein_confidence_output
+
+dataset:
+  class: GO
+  path: {{ datadir }}
+  level: {{level}}
+  percent: 95
+  transform:
+    class: Compose
+    transforms:
+      - class: ProteinView
+        view: residue
+      - class: TruncateProtein
+        max_length: 550
+
+task:
+  class: EarlyExitClassification_walltime
+  model:
+    class: CustomESM2
+    # path: {{ modeldir }}
+    model: "CustomESM2"
+    dropout: 0.2
+    batch_norm: True
+  metric: 'f1_max'
+  verbose: 1
+
+optimizer:
+  class: Adam
+  lr: 1.0e-4
+
+scheduler:
+  class: ReduceLROnPlateau
+  factor: 0.6
+  patience: 5
+
+engine:
+  gpus: [0]
+  batch_size: 8
+  log_interval: 1000
+
+eval_metric: "f1_max"
+freeze_model: True
+
+# Load the model with all layers trained MLPs
+load_weights_only: True
+pretrained_mlp_load: True
+exit: True
+num_layers: 33
+#temperature_threshold: .89
+
+###Model 01####
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_go/model_epoch41.pth
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_go_exit.csv

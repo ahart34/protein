@@ -150,9 +150,10 @@ class FunctionAnnotation_AllLayers(tasks.Task, core.Configurable):
                 name = tasks._get_metric_name(_metric)
                 metric[f"{name} Layer {layer_idx}"] = score
         metric["f1_max"] = total_score_f1
-
+        if os.getenv("CONFIDENCE_CALIBRATION"): 
+            metric["preds"] = [p.detach().cpu() for p in preds]
+            metric["target"] = target.detach().cpu()
         return metric   
-    
 
 @R.register("tasks.PropertyPredictionAllLayers")
 class PropertyPredictionAllLayers(tasks.Task, core.Configurable):
@@ -646,7 +647,7 @@ class Classification_walltime_ProtBert(tasks.Task, core.Configurable):
         """
         Args:
             model_checkpoint (str): Path to the saved model checkpoint.
-            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            mlp_layers (nn.ModuleList): MLP modules for each layer. 
             confidence_classifier (nn.Module): Confidence classifier.
             confidence_threshold (float): Threshold for early exit based on confidence.
         """
@@ -1406,7 +1407,7 @@ class EarlyExitProperty_continuous_protbert(tasks.Task, core.Configurable):
         total = layer_frequencies.sum()
         layer_indices = torch.arange(len(layer_frequencies), device=layer_frequencies.device)
         average_layer = (layer_indices * layer_frequencies).sum() / total
-        metric["avg_layer"] = average_layer
+        metric["avg_layer"] = average_layer.item()
 
         computed_layers = preds["computed_layers"]
         computed_layer_frequencies = torch.bincount(computed_layers)
@@ -1415,11 +1416,6 @@ class EarlyExitProperty_continuous_protbert(tasks.Task, core.Configurable):
         average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
         metric["avg_computed_layer"] = average_computed_layer.item()
 
-        # results_pickle = os.getenv("RESULT_PICKLE")
-        # results = {"preds": pred, "target": target, "layers": layers, "avg_computed_layer": average_computed_layer.item(), "metric": metric, "sequences": sequences}
-
-        # with open(results_pickle, 'wb') as f:
-        #     pickle.dump(results, f)
 
         return metric
 
@@ -1745,3 +1741,1183 @@ class EarlyExitClassificationTemperature_Node_continuous_ProtBert(tasks.Task, co
 ### ESM ###
 ##############################################################
 
+@R.register("tasks.Classification_walltime_ESM")
+class Classification_walltime_ESM(tasks.Task, core.Configurable):
+    def __init__(self, model, metric=('f1_max'), verbose=0, num_class=1, weight=None, confidence_threshold=None):
+        """
+        Args:
+            model_checkpoint (str): Path to the saved model checkpoint.
+            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            confidence_classifier (nn.Module): Confidence classifier.
+            confidence_threshold (float): Threshold for early exit based on confidence.
+        """
+        super(Classification_walltime_ESM, self).__init__()
+        self.model = model  # Load the main model from checkpoint
+        self.confidence_threshold = confidence_threshold
+        self.metric = metric
+
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = self.device
+        graphs = batch["graph"]
+
+        # Convert graphs -> sequences
+        sequences = []
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            seq = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(seq)
+
+        # 1) Tokenize once
+        data_ = [(f"protein_{i}", seq) for i, seq in enumerate(sequences)]
+        _, _, batch_tokens = self.model.alphabet.get_batch_converter()(data_)
+        batch_tokens = batch_tokens.to(device)
+
+        # 2) Build a padding mask
+        padding_mask = batch_tokens.eq(self.model.model.padding_idx)
+        # If your sequences are right-padded, we can pass `padding_mask` to the transformer
+
+        # 3) **Replicate ESM2's forward logic** EXACTLY
+
+        # 3a) Embedding scale
+        x = self.model.model.embed_scale * self.model.model.embed_tokens(batch_tokens)
+
+        # 3b) Token dropout, if ESM2 is using it
+        # (Check self.model.model.token_dropout)
+        if getattr(self.model.model, "token_dropout", False):
+            mask_idx = self.model.model.mask_idx
+            x.masked_fill_((batch_tokens == mask_idx).unsqueeze(-1), 0.0)
+            mask_ratio_train = 0.12  # example
+            src_lengths = (~padding_mask).sum(-1)
+            mask_ratio_observed = (batch_tokens == mask_idx).sum(-1).to(x.dtype) / src_lengths
+            # avoid divide-by-zero for any empty sequences
+            mask_ratio_observed = torch.clamp(mask_ratio_observed, min=1e-9)
+            scale_factor = (1 - mask_ratio_train) / (1 - mask_ratio_observed)
+            x = x * scale_factor.unsqueeze(-1).unsqueeze(-1)
+
+        # 3c) If token != padding, multiply by 1 - padding_mask, etc.
+        if padding_mask.any():
+            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
+
+        # 3d) Now we do the same as ESM2: x => (T, B, E)
+        x = x.transpose(0, 1)  # shape: [seq_len, batch_size, hidden_dim]
+
+        # 6) Iterate over each layer exactly once
+        layer_stop = int(os.getenv("LAYER"))
+        for layer_idx, layer_module in enumerate(self.model.model.layers):
+
+            # apply the layer
+            layer_out = layer_module(
+                x,
+                self_attn_padding_mask=padding_mask
+                    if padding_mask is not None else None,
+                need_head_weights=False
+            )
+            # Some ESM versions return (hidden, attn), some just hidden
+            if isinstance(layer_out, tuple):
+                layer_out = layer_out[0]
+
+            # Place updated states back
+            x = layer_out
+
+            # Check if this is the **final** layer
+            is_final_layer = (layer_idx == self.model.model.num_layers - 1)
+            if is_final_layer:
+                # ESM2 does a final layer norm after the loop
+                x = self.model.model.emb_layer_norm_after(x)
+
+            if layer_idx == layer_stop:
+                hs_for_mlp = x.transpose(0, 1)  # => [num_active, seq_len, hidden_dim]
+                mlp_input = hs_for_mlp.mean(dim=1)  # shape [num_active, hidden_dim]
+                logits = self.mlp[layer_idx](mlp_input)
+                break
+        return{"pred": logits}
+        
+    def target(self, batch):
+        return batch["targets"]
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        if isinstance(self.metric, dict):
+            m = list(self.metric.keys())
+        else:
+            m = self.metric
+
+        if m == "auroc@micro":
+            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+        elif m == "auprc@micro":
+            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+        elif m == "f1_max":
+            score = metrics.f1_max(pred, target)
+        elif m == "acc" or "acc" in m:
+            m = "acc"
+            score = []
+            num_class = 0
+            for i, cur_num_class in enumerate(self.num_class):
+                _pred = pred[:, num_class:num_class + cur_num_class]
+                _target = target[:, i]
+                _labeled = labeled[:, i]
+                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                score.append(_score)
+                num_class += cur_num_class
+            score = torch.stack(score)
+        else:
+            raise ValueError(f"Unknown metric {m}")
+        metric_out[m] = score.item()
+        return metric_out
+
+
+@R.register("tasks.EarlyExitClassification_walltime")
+class EarlyExitClassification_walltime(tasks.Task, core.Configurable):
+    def __init__(self, model, metric=('auprc@micro', 'f1_max'), verbose=0, num_class=1, weight=None, confidence_threshold=None):
+        """
+        Args:
+            model_checkpoint (str): Path to the saved model checkpoint.
+            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            confidence_classifier (nn.Module): Confidence classifier.
+            confidence_threshold (float): Threshold for early exit based on confidence.
+        """
+        super(EarlyExitClassification_walltime, self).__init__()
+        self.model = model  # Load the main model from checkpoint
+        self.confidence_threshold = confidence_threshold
+        self.metric = metric
+        self.num_class = num_class
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+
+
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = self.device
+        graphs = batch["graph"]
+
+        # Convert graphs -> sequences
+        sequences = []
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            seq = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(seq)
+
+        batch_size = len(sequences)
+
+        # We'll store final chosen logits + chosen layer
+        final_logits = [None] * batch_size
+        final_layers = [None] * batch_size
+        best_prob     = torch.full((batch_size,), -float("inf"), device=device)   # NEW
+        best_logits   = [None] * batch_size                                       # NEW
+        best_layers   = [None] * batch_size
+        computed_layers = [None] * batch_size                                       
+
+        # 1) Tokenize once
+        data_ = [(f"protein_{i}", seq) for i, seq in enumerate(sequences)]
+        _, _, batch_tokens = self.model.alphabet.get_batch_converter()(data_)
+        batch_tokens = batch_tokens.to(device)
+
+        # 2) Build a padding mask
+        padding_mask = batch_tokens.eq(self.model.model.padding_idx)
+        # If your sequences are right-padded, we can pass `padding_mask` to the transformer
+
+        # 3) **Replicate ESM2's forward logic** EXACTLY
+
+        # 3a) Embedding scale
+        x = self.model.model.embed_scale * self.model.model.embed_tokens(batch_tokens)
+
+        # 3b) Token dropout, if ESM2 is using it
+        # (Check self.model.model.token_dropout)
+        if getattr(self.model.model, "token_dropout", False):
+            mask_idx = self.model.model.mask_idx
+            x.masked_fill_((batch_tokens == mask_idx).unsqueeze(-1), 0.0)
+
+            # ESM2 also does a ratio-based rescaling
+            # See the official code block that looks like:
+            #    mask_ratio_train = 0.15 * 0.8
+            #    src_lengths = (~padding_mask).sum(-1)
+            #    mask_ratio_observed = (tokens == mask_idx).sum(-1).to(x.dtype) / src_lengths
+            #    x = x * (1 - mask_ratio_train) / (1 - mask_ratio_observed)[:, None, None]
+            mask_ratio_train = 0.12  # example
+            src_lengths = (~padding_mask).sum(-1)
+            mask_ratio_observed = (batch_tokens == mask_idx).sum(-1).to(x.dtype) / src_lengths
+            # avoid divide-by-zero for any empty sequences
+            mask_ratio_observed = torch.clamp(mask_ratio_observed, min=1e-9)
+            scale_factor = (1 - mask_ratio_train) / (1 - mask_ratio_observed)
+            x = x * scale_factor.unsqueeze(-1).unsqueeze(-1)
+
+        # 3c) If token != padding, multiply by 1 - padding_mask, etc.
+        if padding_mask.any():
+            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
+
+        # 3d) Now we do the same as ESM2: x => (T, B, E)
+        x = x.transpose(0, 1)  # shape: [seq_len, batch_size, hidden_dim]
+
+        # 4) Keep track of "active" sample indices
+        active_indices = torch.arange(batch_size, device=device)
+
+        # 5) Temperatures
+        threshold = float(os.getenv("THRESHOLD"))
+        temperature_file = os.getenv("TEMPERATURE_FILE")
+        if temperature_file is not None and temperature_file != 'None':
+            temperatures = self.extract_temperatures(temperature_file)
+            temperatures = torch.tensor(temperatures, device=device)
+        else:
+           temperatures = torch.ones(33)
+
+
+        # 6) Iterate over each layer exactly once
+        for layer_idx, layer_module in enumerate(self.model.model.layers):
+            if len(active_indices) == 0:
+                break
+            for idx in active_indices.tolist():
+                computed_layers[idx] = layer_idx
+
+            # Gather x for active only
+            # x shape is [seq_len, batch_size, hidden_dim].
+            # We want to slice out "batch_size" dimension = active_indices
+            # We'll do an index_select along dim=1:
+            hs_active = x[:, active_indices, :]
+
+            # apply the layer
+            layer_out = layer_module(
+                hs_active,
+                self_attn_padding_mask=padding_mask[active_indices]
+                    if padding_mask is not None else None,
+                need_head_weights=False
+            )
+            # Some ESM versions return (hidden, attn), some just hidden
+            if isinstance(layer_out, tuple):
+                hs_active = layer_out[0]
+            else:
+                hs_active = layer_out
+
+            # Place updated states back
+            x[:, active_indices, :] = hs_active
+
+            # Check if this is the **final** layer
+            is_final_layer = (layer_idx == self.model.model.num_layers - 1)
+            if is_final_layer:
+                # ESM2 does a final layer norm after the loop
+                hs_active = self.model.model.emb_layer_norm_after(hs_active)
+
+            # We want to feed the representation to an MLP
+            # Usually ESM2 store "representations[layer_idx+1]" as hs_active.transpose(0,1)
+            # But let's just do the same for MLP
+            hs_for_mlp = hs_active.transpose(0, 1)  # => [num_active, seq_len, hidden_dim]
+
+            # If normal classification used mean-pooling for each sample, do it here:
+            mlp_input = hs_for_mlp.mean(dim=1)  # shape [num_active, hidden_dim]
+
+            # Then apply the layer's MLP
+            logits_active = self.mlp[layer_idx](mlp_input)
+
+            # Apply temperature scaling & threshold
+            scaled_logits = logits_active / temperatures[layer_idx]
+            probabilities = torch.sigmoid(scaled_logits)
+            max_prob, _ = probabilities.view(probabilities.size(0), -1).max(dim=1)
+
+            # ---------- NEW: keep the best prob/logits seen so far ----------
+            better = max_prob > best_prob[active_indices]
+            if is_final_layer and os.environ.get("SELECT_LAST", "False") == "True":
+                better = torch.full_like(best_prob[active_indices], fill_value=True, dtype=torch.bool)
+
+            if better.any():
+                idx_global = active_indices[better]          # indices in the original batch
+                best_prob[idx_global]   = max_prob[better]   # update tensor (in‑place assignment)
+                for g in idx_global.tolist():                # ✅ update Python lists
+                    best_layers[g] = layer_idx
+                # store **raw** logits (same as you already return when a sample exits)
+                best_logits_arr = logits_active[better]      # shape [n_better, num_classes]
+                for j, g in enumerate(idx_global.tolist()):
+                    best_logits[g] = best_logits_arr[j]
+            # ----------------------------------------
+
+
+
+            meet_threshold_mask = (max_prob > threshold)
+
+            newly_exited = active_indices[meet_threshold_mask]
+            still_active = active_indices[~meet_threshold_mask]
+
+            # Save final logits/layer for those who exit
+            for i, global_idx in enumerate(newly_exited.tolist()):
+                final_logits[global_idx] = logits_active[meet_threshold_mask][i]
+                final_layers[global_idx] = layer_idx
+
+            # Update active_indices
+            active_indices = still_active
+
+        # 7) If any remain after the final layer, they're forced to exit
+        if len(active_indices) > 0:
+            # we already computed final layer above (with LN),
+            # so let's apply the final MLP again for them, if needed
+            for g in active_indices.tolist():
+                final_logits[g] = best_logits[g]
+                final_layers[g] = best_layers[g]
+
+
+        # 8) Stack results
+        selected_outputs = torch.stack(final_logits, dim=0)
+
+        encoded_sequences = []
+        max_len = 2000
+        for seq in sequences:
+            ascii_ids = [ord(c) for c in seq]
+            padded = ascii_ids + [0] * (max_len - len(seq))
+            encoded_sequences.append(padded)
+
+        return {"pred":selected_outputs, "layers":torch.tensor(final_layers, device=self.device, dtype=torch.int64), "computed_layers":torch.tensor(computed_layers, device=self.device, dtype=torch.int64), "sequences":torch.tensor(encoded_sequences, device=self.device, dtype=torch.int64)} 
+
+    def target(self, batch):
+        return batch["targets"]
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        layers = preds["layers"]
+        computed_layers = preds["computed_layers"]
+        sequences = preds["sequences"]
+        target = target.to(pred.device)
+
+        metric_out = {}
+        m = self.metric
+        if m == "f1_max":
+            score = metrics.f1_max(pred, target)
+            metric_out[m] = score.item()
+        else:
+            raise ValueError(f"Unknown metric {m}")
+
+        freq = torch.bincount(layers.cpu())
+        avg_layer = (torch.arange(len(freq), device=freq.device) * freq).sum() / freq.sum()
+
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+
+
+        result["avg_layer"] = avg_layer.item()
+        result["avg_computed_layer"] = average_computed_layer.item()
+        result[m] = metric_out[m]
+        return result
+
+
+@R.register("tasks.EarlyExitProperty_continuous")
+class EarlyExitProperty_continuous(tasks.Task, core.Configurable):
+    eps = 1e-10
+    _option_members = {"task", "criterion", "metric"}
+
+    def __init__(self, model, task=(), criterion="mse", metric=("mae", "rmse"), num_mlp_layer=2, #switched to 2
+                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0):
+        super(EarlyExitProperty_continuous, self).__init__()
+        self.model = model
+        self.task = task
+        self.criterion = criterion
+        self.metric = metric
+        self.num_mlp_layer = num_mlp_layer
+        # For classification tasks, we disable normalization tricks.
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_class = (num_class,) if isinstance(num_class, int) else num_class
+        self.num_layers = model.num_layers
+        self.mlp_batch_norm = mlp_batch_norm
+        self.mlp_dropout = mlp_dropout
+        self.graph_construction_model = graph_construction_model
+        self.verbose = verbose
+        self.confidence_threshold = confidence_threshold
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+    
+    def predict(self, batch, all_loss=None, metric=None):
+        device = self.device
+        threshold = float(os.getenv("THRESHOLD"))
+        #threshold = 0
+        #temperature_file = "/shared/nas2/anna19/early_exit/esm-s/temperature_files/protein01_test_02.csv"
+        temperature_file = os.getenv("TEMPERATURE_FILE")
+        if temperature_file is not None and temperature_file != 'None':
+            temperatures = self.extract_temperatures(temperature_file)
+            temperatures = torch.tensor(temperatures, device=device)
+        else:
+            temperatures = torch.ones(self.num_layers, device=device)
+
+        
+        graphs = batch["graph"]
+        sequences = []
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            sequence = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(sequence)
+        batch_size = len(sequences)
+        input = [(f"protein_{i}", seq) for i, seq in enumerate(sequences)]
+        _, _, batch_tokens = self.model.alphabet.get_batch_converter()(input)
+        batch_tokens = batch_tokens.to(device)
+        
+        # ---------- ESM-2 embedding (same as Classification version) ----------
+        padding_mask = batch_tokens.eq(self.model.model.padding_idx)
+
+        x = self.model.model.embed_scale * self.model.model.embed_tokens(batch_tokens)
+        # x = x + self.model.model.embed_positions(batch_tokens)
+        # x = self.model.model.emb_layer_norm_before(x)
+
+        final_logits = [None] * batch_size
+        final_layers = [None] * batch_size
+        best_prob     = torch.full((batch_size,), -float("inf"), device=device)   # NEW
+        best_logits   = [None] * batch_size                                       # NEW
+        best_layers   = [None] * batch_size
+        computed_layers = [None] * batch_size  
+
+
+        # token-dropout (if present)
+        if getattr(self.model.model, "token_dropout", False):
+            mask_idx = self.model.model.mask_idx
+            x.masked_fill_((batch_tokens == mask_idx).unsqueeze(-1), 0.0)
+            mask_ratio_train = 0.12
+            src_lengths = (~padding_mask).sum(-1)
+            mask_ratio_observed = (batch_tokens == mask_idx).sum(-1).to(x.dtype) / src_lengths
+            mask_ratio_observed = torch.clamp(mask_ratio_observed, min=1e-9)
+            x = x * ((1 - mask_ratio_train) / (1 - mask_ratio_observed)).unsqueeze(-1).unsqueeze(-1)
+
+        if padding_mask.any():
+            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
+
+        # ESM expects [T,B,E]
+        x = x.transpose(0, 1)
+        active_indices = torch.arange(batch_size, device=device)
+       #print(f"{x.shape}")
+        #print(f"padding mask shape {padding_mask.shape}")
+        # ---------------------------------------------------------------------
+        logits_per_layer = []
+        for layer_idx, layer_module in enumerate(self.model.model.layers):
+            if len(active_indices) == 0:
+                break
+            for idx in active_indices.tolist():
+                computed_layers[idx] = layer_idx 
+            hs_active = x[:, active_indices, :]
+            layer_out = layer_module(
+                hs_active,
+                self_attn_padding_mask=padding_mask[active_indices]
+                    if padding_mask is not None else None,
+                need_head_weights=False,
+            )
+
+            hs_active = layer_out[0]
+            #print(f"hs_active.shape {len(hs_active)} {hs_active[0].shape} {hs_active[1].shape}")
+
+            x[:, active_indices, :] = hs_active
+
+            is_final = (layer_idx == self.model.model.num_layers - 1)
+            if is_final:
+                hs_active = self.model.model.emb_layer_norm_after(hs_active)
+
+            mlp_input = hs_active.transpose(0,1)
+            mlp_input = mlp_input.mean(dim=1) ##adding mean pooling MODIFICATIOn
+            logits = self.mlp[layer_idx](mlp_input)
+            
+            scaled_logits = logits / temperatures[layer_idx]
+            probabilities = torch.sigmoid(scaled_logits)
+            max_prob, _ = probabilities.view(probabilities.size(0), -1).max(dim=1)
+
+            better = max_prob > best_prob[active_indices]
+            if is_final and os.environ.get("SELECT_LAST", "False") == "True":
+                better = torch.full_like(best_prob[active_indices], fill_value=True, dtype=torch.bool)
+            if better.any():
+                idx_global = active_indices[better]
+                best_prob[idx_global] = max_prob[better]
+                best_logits_arr = logits[better]
+                for j, g in enumerate(idx_global.tolist()):
+                    best_logits[g] = best_logits_arr[j]
+                    best_layers[g] = layer_idx
+            
+            meet_threshold_mask = (max_prob > threshold)
+            newly_exited = active_indices[meet_threshold_mask]
+            active_indices = active_indices[~meet_threshold_mask]  
+            for i, global_idx in enumerate(newly_exited.tolist()):
+                final_logits[global_idx] = logits[meet_threshold_mask][i]
+                final_layers[global_idx] = layer_idx
+
+             
+        if len(active_indices) > 0:
+            for g in active_indices.tolist():
+                final_logits[g] = best_logits[g]
+                final_layers[g] = best_layers[g]
+
+        selected_outputs = torch.stack(final_logits, dim=0)
+
+
+        encoded_sequences = []
+        max_len = 2000
+        for seq in sequences:
+            ascii_ids = [ord(c) for c in seq]
+            padded = ascii_ids + [0] * (max_len - len(seq))
+            encoded_sequences.append(padded)
+
+        
+        #print(f"selected_outputs {selected_outputs.shape}")
+        #selected_outputs = torch.stack(final_logits, dim=0)
+
+        return {"pred":selected_outputs, "layers":torch.tensor(final_layers, device=self.device, dtype=torch.int64), "computed_layers":torch.tensor(computed_layers, device=self.device, dtype=torch.int64), "sequences":torch.tensor(encoded_sequences, device=self.device, dtype=torch.int64)} 
+
+ 
+    def target(self, batch):
+        target = torch.stack([batch[t].float() for t in self.task], dim=-1)
+        labeled = batch.get("labeled", torch.ones(len(target), dtype=torch.bool, device=target.device))
+        target[~labeled] = math.nan
+        return target
+
+    def evaluate(self, preds, target):
+        pred = preds["pred"]
+        layers = preds["layers"]
+        sequences = preds["sequences"]
+        computed_layers = preds["computed_layers"]
+        print(f"{pred.shape} pred.shape")
+        print(f"self.num class {self.num_class}")
+        labeled = ~torch.isnan(target)
+        metric = {}
+        for _metric in self.metric:
+            if _metric == "auroc@micro":
+                score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+            elif _metric == "auprc@micro":
+                score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+            elif _metric == "f1_max":
+                score = metrics.f1_max(pred, target)
+            elif _metric == "acc":
+                score = []
+                num_class = 0
+                for i, cur_num_class in enumerate(self.num_class):
+                    _pred = pred[:, num_class:num_class + cur_num_class]
+                    _target = target[:, i]
+                    _labeled = labeled[:, i]
+                    _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                    score.append(_score)
+                    num_class += cur_num_class
+                score = torch.stack(score)
+                acc = score.item()
+                metric["acc"] = acc
+            else:
+                raise ValueError("Unknown criterion `%s`" % _metric)
+            
+
+        layer_frequencies = torch.bincount(layers)
+        total = layer_frequencies.sum()
+        layer_indices = torch.arange(len(layer_frequencies), device=layer_frequencies.device)
+        average_layer = (layer_indices * layer_frequencies).sum() / total
+        metric["avg_layer"] = average_layer.item()
+        
+
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+        metric["avg_computed_layer"] = average_computed_layer.item()
+
+        return metric
+
+
+@R.register("tasks.NormalProperty_continuous")
+class NormalProperty_continuous(tasks.Task, core.Configurable):
+    eps = 1e-10
+    _option_members = {"task", "criterion", "metric"}
+
+    def __init__(self, model, task=(), criterion="mse", metric=("mae", "rmse"), num_mlp_layer=2, #switched to 2
+                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0):
+        super(NormalProperty_continuous, self).__init__()
+        self.model = model
+        self.task = task
+        self.criterion = criterion
+        self.metric = metric
+        self.num_mlp_layer = num_mlp_layer
+        # For classification tasks, we disable normalization tricks.
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_class = (num_class,) if isinstance(num_class, int) else num_class
+        self.num_layers = model.num_layers
+        self.mlp_batch_norm = mlp_batch_norm
+        self.mlp_dropout = mlp_dropout
+        self.graph_construction_model = graph_construction_model
+        self.verbose = verbose
+        self.confidence_threshold = confidence_threshold
+        for param in self.model.parameters():
+            param.requires_grad = False
+
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+    
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = self.device
+        graphs = batch["graph"]
+        sequences = []
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            sequence = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(sequence)
+        batch_size = len(sequences)
+        input = [(f"protein_{i}", seq) for i, seq in enumerate(sequences)]
+        _, _, batch_tokens = self.model.alphabet.get_batch_converter()(input)
+        batch_tokens = batch_tokens.to(device)
+        
+        # ---------- ESM-2 embedding (same as Classification version) ----------
+        padding_mask = batch_tokens.eq(self.model.model.padding_idx)
+
+        x = self.model.model.embed_scale * self.model.model.embed_tokens(batch_tokens)
+        # x = x + self.model.model.embed_positions(batch_tokens)
+        # x = self.model.model.emb_layer_norm_before(x)
+        layer_stop = int(os.getenv("LAYER"))
+        # token-dropout (if present)
+        if getattr(self.model.model, "token_dropout", False):
+            mask_idx = self.model.model.mask_idx
+            x.masked_fill_((batch_tokens == mask_idx).unsqueeze(-1), 0.0)
+            mask_ratio_train = 0.12
+            src_lengths = (~padding_mask).sum(-1)
+            mask_ratio_observed = (batch_tokens == mask_idx).sum(-1).to(x.dtype) / src_lengths
+            mask_ratio_observed = torch.clamp(mask_ratio_observed, min=1e-9)
+            x = x * ((1 - mask_ratio_train) / (1 - mask_ratio_observed)).unsqueeze(-1).unsqueeze(-1)
+
+        if padding_mask.any():
+            x = x * (1 - padding_mask.unsqueeze(-1).type_as(x))
+
+        # ESM expects [T,B,E]
+        x = x.transpose(0, 1)
+        # ---------------------------------------------------------------------
+
+        for layer_idx, layer_module in enumerate(self.model.model.layers):
+            layer_out = layer_module(
+                x,
+                self_attn_padding_mask=padding_mask
+                    if padding_mask is not None else None,
+                need_head_weights=False,
+            )
+            if isinstance(layer_out, tuple):
+                x = layer_out[0]
+            else:
+                x = layer_out
+
+            is_final = layer_idx == self.model.model.num_layers - 1
+            if is_final:
+                x = self.model.model.emb_layer_norm_after(x)
+
+            if layer_idx == layer_stop:
+                mlp_input = x.transpose(0,1)
+                mlp_input = mlp_input.mean(dim=1) ##adding mean pooling MODIFICATIOn
+                logits = self.mlp[layer_idx](mlp_input)
+
+        return {"pred":logits} 
+ 
+    def target(self, batch):
+        target = torch.stack([batch[t].float() for t in self.task], dim=-1)
+        labeled = batch.get("labeled", torch.ones(len(target), dtype=torch.bool, device=target.device))
+        target[~labeled] = math.nan
+        return target
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        if isinstance(self.metric, dict):
+            m = list(self.metric.keys())
+        else:
+            m = self.metric
+
+        if m == "auroc@micro":
+            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+        elif m == "auprc@micro":
+            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+        elif m == "f1_max":
+            score = metrics.f1_max(pred, target)
+        elif m == "acc" or "acc" in m:
+            m = "acc"
+            score = []
+            num_class = 0
+            for i, cur_num_class in enumerate(self.num_class):
+                _pred = pred[:, num_class:num_class + cur_num_class]
+                _target = target[:, i]
+                _labeled = labeled[:, i]
+                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                score.append(_score)
+                num_class += cur_num_class
+            score = torch.stack(score)
+        else:
+            raise ValueError(f"Unknown metric {m}")
+        metric_out[m] = score.item()
+        return metric_out
+
+
+@R.register("tasks.EarlyExitClassificationTemperature_Node_continuous")
+class EarlyExitClassificationTemperature_Node_continuous(tasks.Task, core.Configurable):
+    _option_members = {"criterion", "metric"}
+
+    def __init__(
+        self,
+        model,
+        criterion="bce",
+        metric=("macro_auprc", "macro_auroc"),
+        num_mlp_layer=1,
+        normalization=True,
+        num_class=None,
+        verbose=0,
+    ):
+        super(EarlyExitClassificationTemperature_Node_continuous, self).__init__()
+        self.model = model
+        self.criterion = criterion
+        self.metric = metric
+        # For classification tasks, disable normalization
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_mlp_layer = num_mlp_layer
+        self.num_class = num_class
+        self.verbose = verbose
+        self.num_layers = 33
+
+    def extract_temperatures(self, file_path):
+        temperatures = []
+        with open(file_path, 'r') as csvfile:
+            reader = csv.reader(csvfile)
+            next(reader)  # Skip the header row
+            for row in reader:
+                # Extract the tensor value from the second column and parse the float
+                tensor_string = row[1]
+                value = float(tensor_string.split('(')[1].split(',')[0])
+                temperatures.append(value)
+        return temperatures
+
+    def preprocess(self, train_set, valid_set, test_set):
+        """
+        Compute mean, std, and num_class on the training set,
+        then build an MLP head per layer.
+        """
+        # Determine whether we are working at the node, atom, or residue level
+        self.view = getattr(train_set[0]["graph"], "view", "atom")
+
+        # Collect all target values from the train set for statistics
+        values_list = []
+        for data in train_set:
+            values_list.append(data["graph"].target)  # shape: (num_nodes,) or (num_residues,)
+
+        values = torch.cat(values_list, dim=0)
+        mean = values.float().mean()
+        std = values.float().std()
+
+        # Figure out number of classes if doing classification
+        num_class = 1
+        if values.dtype == torch.long:
+            # If max label is >1 or not using BCE, it means multiclass
+            nmax = values.max().item()
+            if nmax > 1 or "bce" not in self.criterion:
+                nmax += 1
+            num_class = nmax
+
+        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float))
+        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float))
+        self.num_class = self.num_class or num_class
+
+    def predict(self, batch, all_loss=None, metric=None):
+        """
+        Return a list of predictions (one per layer).
+        Each layer's node_feature is passed to a separate MLP.
+        """
+
+        graphs = batch["graph"]
+        sequences = []
+        device = next(self.model.parameters()).device
+        n_layers  = 33
+
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            sequence = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(sequence)
+
+        B = len(sequences)
+        temp_file = os.getenv("TEMPERATURE_FILE")
+        if temp_file and temp_file.lower() != "none":
+            temps = torch.tensor(self.extract_temperatures(temp_file), device=device)              # shape (num_layers,)
+        else:
+            temps = torch.ones(self.model.model.num_layers, device=device)
+
+        threshold = float(os.getenv("THRESHOLD"))
+        percent = float(os.getenv("PERCENT"))
+
+        final_logits = [None] * B
+        final_layers = torch.full((B,), -1, device=device) 
+        best_logits = [None] * B
+        best_prob = torch.full((B,), -float("inf"), device=device)
+        best_layers = torch.full((B,), -1, device=device) 
+        computed_layers = torch.full((B,), -1, device=device)
+
+        data_ = [(f"protein_{i}", s) for i, s in enumerate(sequences)]
+        _, _, batch_tokens = self.model.alphabet.get_batch_converter()(data_)
+        batch_tokens = batch_tokens.to(device)
+        padding_mask = batch_tokens.eq(self.model.model.padding_idx)
+
+        x = self.model.model.embed_scale * self.model.model.embed_tokens(batch_tokens)
+        if getattr(self.model.model, "token_dropout", False):
+            mask_idx = self.model.model.mask_idx
+            x.masked_fill_((batch_tokens == mask_idx).unsqueeze(-1), 0.0)
+            mask_ratio_train = 0.12
+            src_len = (~padding_mask).sum(-1)
+            mask_ratio_obs = (batch_tokens == mask_idx).sum(-1).to(x.dtype) / src_len
+            mask_ratio_obs = torch.clamp(mask_ratio_obs, min=1e-9)
+            x *= ((1 - mask_ratio_train) / (1 - mask_ratio_obs)).unsqueeze(-1).unsqueeze(-1)
+        x = x * (1 - padding_mask.unsqueeze(-1).type_as(x)) 
+        x = x.transpose(0, 1) 
+        active = torch.arange(B, device=device)
+
+        total = 0
+
+        for lidx, layer in enumerate(self.model.model.layers):
+            if active.numel() == 0:
+                break
+            for idx in active.tolist():
+                computed_layers[idx] = lidx 
+            h = x[:, active, :]
+            h = layer(h, self_attn_padding_mask=padding_mask[active], need_head_weights=False)[0]
+            x[:, active, :] = h
+            h_seq = h.transpose(0,1)
+            logits_list = []
+            max_prob_for_mean = torch.empty(active.size(0), device=device)
+            for local_idx, glob_idx in enumerate(active.tolist()):
+                seq_len = len(sequences[glob_idx])
+                h_i = h_seq[local_idx, :seq_len, :]
+                logits_i = self.mlp[lidx](h_i)
+                logits_list.append(logits_i)
+                scaled = logits_i/temps[lidx]
+                probs = torch.sigmoid(scaled)
+                max_res = probs.max(dim=1).values
+                max_prob_for_mean[local_idx] = max_res.mean()
+
+                if (max_res > threshold).float().mean() >= percent:
+                    final_logits[glob_idx] = logits_i
+                    final_layers[glob_idx] = lidx
+
+            done_mask = final_layers[active] != -1
+            newly_done = active[done_mask]
+            still_active = active[~done_mask]
+            is_final = lidx == n_layers - 1
+
+            if still_active.numel() > 0:
+                better = max_prob_for_mean[~done_mask] > best_prob[still_active]
+                if is_final and os.getenv("SELECT_LAST", "False") == "True":
+                    better = torch.ones_like(better, dtype=torch.bool)
+
+                if better.any():
+                    upd_idx = still_active[better]
+                    best_prob[upd_idx]   = max_prob_for_mean[~done_mask][better]
+                    best_layers[upd_idx] = lidx
+                    for k, g in enumerate(upd_idx.tolist()):
+                        best_logits[g] = logits_list[(~done_mask).nonzero(as_tuple=True)[0][k]]
+            active = still_active
+        if active.numel() > 0:
+            for g in active.tolist():
+                final_logits[g] = best_logits[g]
+                final_layers[g] = best_layers[g]
+
+        ascii_mat = torch.nn.utils.rnn.pad_sequence(
+                [torch.tensor([ord(c) for c in s], device=device) for s in sequences],
+                batch_first=True, padding_value=0,
+            )
+        if ascii_mat.size(1) < 2000:
+            pad = ascii_mat.new_zeros(ascii_mat.size(0), 2000 - ascii_mat.size(1))
+            ascii_mat = torch.cat([ascii_mat, pad], dim=1)
+        return {
+            "pred": final_logits,
+            "layers": final_layers,
+            "computed_layers": torch.tensor(computed_layers, device=self.device, dtype=torch.int64),
+            "sequences": ascii_mat
+        }
+    
+    def target(self, batch):
+        """
+        Return a dictionary with:
+          "label": the node-level target
+          "mask": a boolean mask indicating which nodes are labeled
+          "size": used for some metrics requiring per-graph aggregates
+        """
+        graph = batch["graph"]
+        size = graph.num_nodes if self.view in ["node", "atom"] else graph.num_residues
+        return {
+            "label": graph.target,   # shape: (num_nodes,) or (num_residues,)
+            "mask": graph.mask,      # shape: (num_nodes,) or (num_residues,)
+            "size": size
+        }
+
+    def evaluate(self, preds, target):
+        """
+        Evaluate each layer's predictions given the `target`.
+        preds: list of tensors, each is shape (N, num_class) or (N,) depending on your MLP output
+        target: dict with { "label", "mask", "size" }
+        """
+        metric = {}
+        _target = target["label"]
+        _mask = target["mask"]
+        labeled = ~torch.isnan(_target) & _mask
+        _size = functional.variadic_sum(labeled.long(), target["size"])
+        pred = preds["pred"]
+
+        layers = preds["layers"]
+        layer_frequencies = torch.bincount(layers)
+        total = layer_frequencies.sum()
+        layer_indices = torch.arange(len(layer_frequencies), device=layer_frequencies.device)
+        average_layer = (layer_indices * layer_frequencies).sum() / total
+
+        for _metric in self.metric:
+            if _metric in ["mae", "rmse"]:
+                # Typically for regression
+                if _metric == "mae":
+                    score = F.l1_loss(pred, _target, reduction="none")
+                else:  # rmse
+                    score = F.mse_loss(pred, _target, reduction="none").sqrt()
+
+                score = functional.masked_mean(score, labeled, dim=0)
+
+            elif _metric in ["micro_auroc", "micro_auprc"]:
+                # Single "micro" approach across all labeled nodes
+                if _metric == "micro_auroc":
+                    score = metrics.area_under_roc(pred[labeled], _target[labeled])
+                else:
+                    score = metrics.area_under_prc(pred[labeled], _target[labeled])
+
+            elif _metric in ["macro_auroc", "macro_auprc"]:
+                # "macro" means compute per-graph, then average
+                if _metric == "macro_auroc":
+                    score = metrics.variadic_area_under_roc(pred[labeled], _target[labeled], _size).mean()
+                else:
+                    score = metrics.variadic_area_under_prc(pred[labeled], _target[labeled], _size).mean()
+
+            elif _metric == "macro_acc":
+                # One typical approach for multi-class:
+                # (pred[labeled].argmax(-1) == _target[labeled]).float()
+                #print(f"labeled.shape {labeled.shape}")
+                #print(f"target shape {_target.shape}")
+                #pred = torch.cat(pred, dim=0)
+                pred = torch.cat(pred, dim=0)
+                #print(f"pred.shape {pred.shape}")
+                pred_argmax = pred[labeled].argmax(dim=-1)
+                correct = (pred_argmax == _target[labeled]).float()
+                score = functional.variadic_mean(correct, _size).mean()
+                metric["macro_acc"] = score.item()
+
+            else:
+                raise ValueError(f"Unknown metric `{_metric}`")
+            metric["layer"] = average_layer.item()
+
+        computed_layers = preds["computed_layers"]
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+        metric["avg_computed_layer"] = average_computed_layer.item()
+
+        result = {}
+
+        # with open(os.getenv("RESULT_PICKLE"), "wb") as f:
+        #     pickle.dump(
+        #         {"preds": pred, "target": target, "layers": layers, "avg_computed_layer": average_computed_layer,
+        #          "metric": metric[_metric], "sequences": preds["sequences"]}, f
+        #     )
+
+        result["avg_layer"] = average_layer.item()
+        result["avg_computed_layer"] = average_computed_layer.item()
+        result["macro_acc"] = metric["macro_acc"]
+        return result
+    
+
+@R.register("tasks.ClassificationTemperature_Node_continuous")
+class ClassificationTemperature_Node_continuous(tasks.Task, core.Configurable):
+    _option_members = {"criterion", "metric"}
+
+    def __init__(
+        self,
+        model,
+        criterion="bce",
+        metric=("macro_auprc", "macro_auroc"),
+        num_mlp_layer=1,
+        normalization=True,
+        num_class=None,
+        verbose=0,
+    ):
+        super(ClassificationTemperature_Node_continuous, self).__init__()
+        self.model = model
+        self.criterion = criterion
+        self.metric = metric
+        # For classification tasks, disable normalization
+        self.normalization = normalization and ("ce" not in criterion) and ("bce" not in criterion)
+        self.num_mlp_layer = num_mlp_layer
+        self.num_class = num_class
+        self.verbose = verbose
+        self.num_layers = 33
+
+    def preprocess(self, train_set, valid_set, test_set):
+        """
+        Compute mean, std, and num_class on the training set,
+        then build an MLP head per layer.
+        """
+        # Determine whether we are working at the node, atom, or residue level
+        self.view = getattr(train_set[0]["graph"], "view", "atom")
+
+        # Collect all target values from the train set for statistics
+        values_list = []
+        for data in train_set:
+            values_list.append(data["graph"].target)  # shape: (num_nodes,) or (num_residues,)
+
+        values = torch.cat(values_list, dim=0)
+        mean = values.float().mean()
+        std = values.float().std()
+
+        # Figure out number of classes if doing classification
+        num_class = 1
+        if values.dtype == torch.long:
+            # If max label is >1 or not using BCE, it means multiclass
+            nmax = values.max().item()
+            if nmax > 1 or "bce" not in self.criterion:
+                nmax += 1
+            num_class = nmax
+
+        self.register_buffer("mean", torch.as_tensor(mean, dtype=torch.float))
+        self.register_buffer("std", torch.as_tensor(std, dtype=torch.float))
+        self.num_class = self.num_class or num_class
+
+    def predict(self, batch, all_loss=None, metric=None):
+        """
+        Return a list of predictions (one per layer).
+        Each layer's node_feature is passed to a separate MLP.
+        """
+
+        graphs = batch["graph"]
+        sequences = []
+        device = next(self.model.parameters()).device
+        n_layers  = 33
+
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            sequence = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(sequence)
+
+        B = len(sequences)
+
+        layer = int(os.getenv("LAYER"))
+
+        data_ = [(f"protein_{i}", s) for i, s in enumerate(sequences)]
+        _, _, batch_tokens = self.model.alphabet.get_batch_converter()(data_)
+        batch_tokens = batch_tokens.to(device)
+        padding_mask = batch_tokens.eq(self.model.model.padding_idx)
+
+        x = self.model.model.embed_scale * self.model.model.embed_tokens(batch_tokens)
+        if getattr(self.model.model, "token_dropout", False):
+            mask_idx = self.model.model.mask_idx
+            x.masked_fill_((batch_tokens == mask_idx).unsqueeze(-1), 0.0)
+            mask_ratio_train = 0.12
+            src_len = (~padding_mask).sum(-1)
+            mask_ratio_obs = (batch_tokens == mask_idx).sum(-1).to(x.dtype) / src_len
+            mask_ratio_obs = torch.clamp(mask_ratio_obs, min=1e-9)
+            x *= ((1 - mask_ratio_train) / (1 - mask_ratio_obs)).unsqueeze(-1).unsqueeze(-1)
+        x = x * (1 - padding_mask.unsqueeze(-1).type_as(x)) 
+        x = x.transpose(0, 1) 
+        
+        for lidx, layer_mod in enumerate(self.model.model.layers):
+            h = layer_mod(x, self_attn_padding_mask = padding_mask, need_head_weights=False)[0]
+            x = h
+            if lidx == layer:
+                break
+
+        h_seq = h.transpose(0,1)
+        logits_list = []
+        for b in range(B):
+            seq_len   = len(sequences[b])
+            h_b       = h_seq[b, :seq_len, :]              # strip pad positions
+            logits_b  = self.mlp[layer](h_b)              # (seq_len, num_classes)
+            logits_list.append(logits_b)
+
+        return {"pred": logits_list}
+            
+    def target(self, batch):
+        """
+        Return a dictionary with:
+          "label": the node-level target
+          "mask": a boolean mask indicating which nodes are labeled
+          "size": used for some metrics requiring per-graph aggregates
+        """
+        graph = batch["graph"]
+        size = graph.num_nodes if self.view in ["node", "atom"] else graph.num_residues
+        return {
+            "label": graph.target,   # shape: (num_nodes,) or (num_residues,)
+            "mask": graph.mask,      # shape: (num_nodes,) or (num_residues,)
+            "size": size
+        }
+
+    def evaluate(self, preds, target):
+        """
+        Evaluate each layer's predictions given the `target`.
+        preds: list of tensors, each is shape (N, num_class) or (N,) depending on your MLP output
+        target: dict with { "label", "mask", "size" }
+        """
+        metric = {}
+        _target = target["label"]
+        _mask = target["mask"]
+        labeled = ~torch.isnan(_target) & _mask
+        _size = functional.variadic_sum(labeled.long(), target["size"])
+        pred = preds["pred"]
+
+        device = pred.device if hasattr(pred, 'device') else (
+        pred["pred"].device if isinstance(pred, dict) and "pred" in pred else 
+        (pred[0].device if isinstance(pred, list) and len(pred) > 0 else torch.device("cpu"))
+        )
+
+        # Move target to the same device as pred
+        _target = _target.to(device)
+        labeled = labeled.to(device)
+        _size = _size.to(device)
+
+        if isinstance(self.metric, dict):
+            m = list(self.metric.keys())
+        elif isinstance(self.metric, (list, tuple)):
+            m = list(self.metric)
+        else:
+            m = self.metric
+        if isinstance(m, list) and len(m) == 1:
+            m = m[0]
+
+        if m == "macro_acc" or "macro_acc" in m:
+            pred = torch.cat(pred, dim=0)
+            pred_argmax = pred[labeled].argmax(dim=-1)
+            correct = (pred_argmax == _target[labeled]).float()
+            score = functional.variadic_mean(correct, _size).mean()
+            metric["macro_acc"] = score.item()
+
+        else:
+            raise ValueError(f"Unknown metric `{m}`")
+
+        return metric

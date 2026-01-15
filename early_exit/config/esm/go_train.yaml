@@ -3,6 +3,7 @@ output_dir: ~/scratch/anna19/protein_output
 dataset:
   class: GO
   path: {{ datadir }}
+  level: {{level}}
   percent: 95
   transform:
     class: Compose

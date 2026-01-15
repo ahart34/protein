@@ -15,11 +15,11 @@ dataset:
         view: "residue"
 
 task:
-  class: Property_walltime_ProtBert
+  class: NormalProperty_continuous
   model:
-    class: CustomProtBert
+    class: CustomESM2
     # path: {{ modeldir }}
-    model: "CustomProtBert"
+    model: "CustomESM2"
   metric: 'acc'
   verbose: 1
   num_mlp_layer: 2
@@ -43,10 +43,10 @@ eval_metric: 'accuracy'
 freeze_model: True
 # Load the model with all layers trained MLPs
 load_weights_only: True
-pretrained_mlp_load_property_bert: True
+pretrained_mlp_load_property: True
 evaluate: True
-num_layers: 30
+num_layers: 33
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_cl/model_epoch89.pth
-result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_cl_eval.csv
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_cl/model_epoch84.pth
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_cl_eval.csv

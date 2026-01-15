@@ -26,6 +26,7 @@ import dataset, task
 import glob
 import csv
 import pdb
+import json
 
 
 def train_and_validate_all_layers(cfg, solver, scheduler):
@@ -254,8 +255,45 @@ if __name__ == "__main__":
                 metric = results[cfg.task.metric]  
                 writer.writerow([layer, metric, timee])
                 f.flush()
+    elif cfg.get("evaluate_confidence"):
+        os.environ["CONFIDENCE_CALIBRATION"] = "True"
+        if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+            cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+            train_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+            valid_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
+            test_set = core.Configurable.load_config_dict(cfg.dataset)
+            dataset = (train_set, valid_set, test_set)
+        else:
+            dataset = core.Configurable.load_config_dict(cfg.dataset)
+        solver, scheduler = util.build_downstream_solver(cfg, dataset)
+        results = solver.evaluate("test")
+        preds = results["preds"]
+        target = results["target"]
+        metric = results[cfg.task.metric]
+        out_file_base= cfg.get("out_file_base")
+        pt_path = os.path.join(out_file_base + ".pt")
+        meta_path = os.path.join(out_file_base + ".json")
+        torch.save({
+            "preds_by_layer": preds,
+            "target": target,
+        },
+        pt_path
+        )
+        with open(meta_path, "w") as f:
+            json.dump(
+                {
+                    "dataset_class": cfg.dataset["class"],
+                    "split": "test",
+                    "n_examples": int(target.shape[0]),
+                    "n_classes": int(target.shape[1]),
+                    "n_layers": int(len(preds)),
+                },
+                f,
+                indent=2,
+        )
     elif cfg.get("exit"):
-            
         if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
             cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
             train_set = core.Configurable.load_config_dict(cfg.dataset)
