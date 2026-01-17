@@ -1035,6 +1035,7 @@ class EarlyExitClassification_walltime_ProtBert(tasks.Task, core.Configurable):
         self.model = model  # Load the main model from checkpoint
         self.metric = metric
         self.tokenizer=tokenizer
+        self.num_class = num_class
 
     # ------------- helper to space‑separate sequences ------------
     @staticmethod
@@ -1755,6 +1756,7 @@ class Classification_walltime_ESM(tasks.Task, core.Configurable):
         self.model = model  # Load the main model from checkpoint
         self.confidence_threshold = confidence_threshold
         self.metric = metric
+        self.num_class = num_class
 
     def predict(self, batch, all_loss=None, metric=None):
 
@@ -2921,3 +2923,462 @@ class ClassificationTemperature_Node_continuous(tasks.Task, core.Configurable):
             raise ValueError(f"Unknown metric `{m}`")
 
         return metric
+
+
+def evaluate_classification(preds, target, metric, num_class=None):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        if isinstance(metric, dict):
+            m = list(metric.keys())
+        else:
+            m = metric
+
+        if m == "auroc@micro":
+            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+        elif m == "auprc@micro":
+            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+        elif m == "f1_max":
+            score = metrics.f1_max(pred, target)
+        elif m == "acc" or "acc" in m:
+            m = "acc"
+            score = []
+            num_class = 0
+            for i, cur_num_class in enumerate(num_class):
+                _pred = pred[:, num_class:num_class + cur_num_class]
+                _target = target[:, i]
+                _labeled = labeled[:, i]
+                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                score.append(_score)
+                num_class += cur_num_class
+            score = torch.stack(score)
+        else:
+            raise ValueError(f"Unknown metric {m}")
+        metric_out[m] = score.item()
+        layer_idx = int(os.getenv("LAYER"))
+        out_file = os.getenv("OUT_FILE")
+        
+        # Load existing data if file exists, or create new structure
+        if os.path.exists(out_file) and layer_idx >= 0:
+            data = torch.load(out_file)
+        else:
+            data = {"preds_by_layer": [], "target": None}
+        
+        # Append this layer's predictions
+        data["preds_by_layer"].append(pred.detach().cpu())
+        
+        # Store target once (first layer)
+        if data["target"] is None:
+            data["target"] = target.detach().cpu()
+        
+        # Save back to file
+        torch.save(data, out_file)
+        return metric_out
+
+def evaluate_property_confidence(preds, target, self_num_class):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+
+        out_file = os.getenv("OUT_FILE")
+        layer_idx = int(os.getenv("LAYER"))
+
+        if os.path.exists(out_file):
+            data = torch.load(out_file, map_location="cpu")
+            # If file exists but doesn't match expected structure, reset
+            if not isinstance(data, dict) or "preds_by_layer" not in data:
+                data = {"preds_by_layer": [], "target": None}
+        else:
+            data = {"preds_by_layer": [], "target": None}
+
+        # Append this layer's logits
+        data["preds_by_layer"].append(pred.detach().cpu())
+
+        # Store target once (first write)
+        if data.get("target") is None:
+            data["target"] = target.detach().cpu()
+
+        torch.save(data, out_file)
+
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        m = "acc"
+        score = []
+        num_class = 0
+        for i, cur_num_class in enumerate(self_num_class):
+            _pred = pred[:, num_class:num_class + cur_num_class]
+            _target = target[:, i]
+            _labeled = labeled[:, i]
+            _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+            score.append(_score)
+            num_class += cur_num_class
+        score = torch.stack(score)
+
+        metric_out[m] = score.item()
+
+        return metric_out
+
+##### ProtAlbert ######
+
+@R.register("tasks.Classification_walltime_ProtAlbert") #--> old, was used for first max
+class Classification_walltime_ProtAlbert(tasks.Task, core.Configurable):
+    def __init__(self, model, metric=('auprc@micro', 'f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer):
+        """
+        Args:
+            model_checkpoint (str): Path to the saved model checkpoint.
+            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            confidence_classifier (nn.Module): Confidence classifier.
+            confidence_threshold (float): Threshold for early exit based on confidence.
+        """
+        super(Classification_walltime_ProtAlbert, self).__init__()
+        self.model = model  # Load the main model from checkpoint
+        self.metric = metric
+        self.tokenizer=tokenizer
+
+    @staticmethod
+    def _prep_protalbert(seqs):
+        cleaned = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            cleaned.append(" ".join(list(s)))
+        return cleaned
+
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        #print(f"device {device}")
+        graphs = batch["graph"]
+        self.model.to(device).eval() 
+        self.mlp.to(device).eval()
+
+
+        # Convert graphs -> sequences
+        sequences = []
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            seq = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(seq)
+                              
+
+        # 1) Tokenize once
+        prepared = self._prep_protalbert(sequences)                       # EDIT
+        enc = self.tokenizer(
+            prepared,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,          # ProtAlbert max = 512
+            return_tensors="pt",
+            max_length = 550,
+        )
+        input_ids      = enc["input_ids"     ].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+
+
+        # 5) Temperatures
+        layer_out = int(os.getenv("LAYER"))
+
+        n_layers  = self.model.config.num_hidden_layers
+
+        hs = self.model.embeddings(input_ids)
+        hs = self.model.encoder.embedding_hidden_mapping_in(hs)
+        attn_ext = (1.0 - attention_mask[:, None, None, :]) * -10000.0
+
+        groups = self.model.encoder.albert_layer_groups
+        layers_per_group = n_layers // self.model.config.num_hidden_groups
+        global_layer_idx = 0
+        layer_int = 0
+        for group in groups:
+            for _ in range(layers_per_group):
+
+                # ---- forward one logical layer ----
+                                               # (N,L,H)
+                hs = group(
+                    hs,
+                    attention_mask=attn_ext,
+                    head_mask=[None] * self.model.config.num_hidden_layers,  # ← FIX HERE
+                    output_attentions=False,
+                )
+                hs = hs[0] if isinstance(hs, tuple) else hs
+
+                # ---- classifier ----
+                if layer_int == layer_out:
+                    pooled = hs.mean(dim=1)                                        # (N,H)
+                    logits = self.mlp[global_layer_idx](pooled)
+                layer_int += 1
+                global_layer_idx += 1
+        return {
+            "pred": logits,
+        }
+
+    def target(self, batch):
+        return batch["targets"]
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        if isinstance(self.metric, dict):
+            m = list(self.metric.keys())
+        else:
+            m = self.metric
+
+        if m == "auroc@micro":
+            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+        elif m == "auprc@micro":
+            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+        elif m == "f1_max":
+            score = metrics.f1_max(pred, target)
+        elif m == "acc" or "acc" in m:
+            m = "acc"
+            score = []
+            num_class = 0
+            for i, cur_num_class in enumerate(self.num_class):
+                _pred = pred[:, num_class:num_class + cur_num_class]
+                _target = target[:, i]
+                _labeled = labeled[:, i]
+                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                score.append(_score)
+                num_class += cur_num_class
+            score = torch.stack(score)
+        else:
+            raise ValueError(f"Unknown metric {m}")
+        metric_out[m] = score.item()
+        return metric_out
+
+@R.register("tasks.EarlyExitClassification_walltime_ProtAlbert") #--> old, was used for first max
+class EarlyExitClassification_walltime_ProtAlbert(tasks.Task, core.Configurable):
+    def __init__(self, model, metric=('auprc@micro', 'f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer):
+        """
+        Args:
+            model_checkpoint (str): Path to the saved model checkpoint.
+            mlp_layers (nn.ModuleList): MLP modules for each layer.
+            confidence_classifier (nn.Module): Confidence classifier.
+            confidence_threshold (float): Threshold for early exit based on confidence.
+        """
+        super(EarlyExitClassification_walltime_ProtAlbert, self).__init__()
+        self.model = model  # Load the main model from checkpoint
+        self.metric = metric
+        self.tokenizer=tokenizer
+
+    @staticmethod
+    def _prep_protalbert(seqs):
+        cleaned = []
+        for s in seqs:
+            s = s.upper().replace("U", "X").replace("O", "X")
+            cleaned.append(" ".join(list(s)))
+        return cleaned
+
+    def predict(self, batch, all_loss=None, metric=None):
+
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        graphs = batch["graph"]
+        self.model.to(device).eval() 
+        self.mlp.to(device).eval()
+
+
+        # Convert graphs -> sequences
+        sequences = []
+        for graph in graphs:
+            residue_ids = graph.residue_type.tolist()
+            seq = "".join(data.Protein.id2residue_symbol[res] for res in residue_ids)
+            sequences.append(seq)
+
+        batch_size = len(sequences)
+
+        # We'll store final chosen logits + chosen layer
+        final_logits = [None] * batch_size
+        final_layers = [None] * batch_size
+        best_prob     = torch.full((batch_size,), -float("inf"), device=device)   # NEW
+        best_logits   = [None] * batch_size                                       # NEW
+        best_layers   = [None] * batch_size      
+        computed_layers = [None] * batch_size
+        active = torch.arange(batch_size, device=device)                                 
+
+        # 1) Tokenize once
+        prepared = self._prep_protalbert(sequences)                       # EDIT
+        enc = self.tokenizer(
+            prepared,
+            add_special_tokens=True,
+            padding=True,
+            truncation=True,          # ProtAlbert max = 512
+            return_tensors="pt",
+            max_length = 550,
+        )
+        input_ids      = enc["input_ids"     ].to(device)
+        attention_mask = enc["attention_mask"].to(device)
+
+
+        # 5) Temperatures
+        threshold = float(os.getenv("THRESHOLD"))
+        # temperature_file = os.getenv("TEMPERATURE_FILE")
+        # if temperature_file is not None and temperature_file != 'None':
+        #     temperatures = self.extract_temperatures(temperature_file)
+        #     temperatures = torch.tensor(temperatures, device=device)
+        # else:
+        n_layers  = self.model.config.num_hidden_layers
+        temps = torch.ones(n_layers, device=device)
+        
+
+        hs = self.model.embeddings(input_ids)
+        hs = self.model.encoder.embedding_hidden_mapping_in(hs)
+        attn_ext = (1.0 - attention_mask[:, None, None, :]) * -10000.0
+
+        groups = self.model.encoder.albert_layer_groups
+        layers_per_group = n_layers // self.model.config.num_hidden_groups
+        global_layer_idx = 0
+
+        for group in groups:
+            for _ in range(layers_per_group):
+                if len(active) == 0:
+                    break
+                for idx in active.tolist():
+                    computed_layers[idx] = global_layer_idx
+
+                # ---- forward one logical layer ----
+                hs_active = hs[active]                                                # (N,L,H)
+                hs_active = group(
+                    hs_active,
+                    attention_mask=attn_ext[active],
+                    head_mask=[None] * self.model.config.num_hidden_layers,  # ← FIX HERE
+                    output_attentions=False,
+                )
+                hs_active = hs_active[0] if isinstance(hs_active, tuple) else hs_active
+                hs[active] = hs_active
+
+                # ---- classifier ----
+                pooled = hs_active.mean(dim=1)                                        # (N,H)
+                logits = self.mlp[global_layer_idx](pooled)
+                prob   = torch.sigmoid(logits / temps[global_layer_idx])
+                max_p, _ = prob.max(dim=1)
+
+                # ---- best‑so‑far bookkeeping ----
+                is_final = global_layer_idx == n_layers - 1
+                better   = max_p > best_prob[active]
+                if is_final and os.getenv("SELECT_LAST", "False") == "True":
+                    better = torch.ones_like(better, dtype=torch.bool)
+
+                if better.any():
+                    g_idx = active[better]
+                    best_prob[g_idx] = max_p[better]
+                    for j, gi in enumerate(g_idx.tolist()):
+                        best_logits[gi] = logits[better][j]
+                        best_layers[gi] = global_layer_idx
+
+                # ---- early‑exit decision ----
+                exit_mask   = max_p > threshold
+                newly_exit  = active[exit_mask]
+                still_act   = active[~exit_mask]
+
+                for j, gi in enumerate(newly_exit.tolist()):
+                    final_logits[gi] = logits[exit_mask][j]
+                    final_layers[gi] = global_layer_idx
+
+                active = still_act
+                global_layer_idx += 1
+            if len(active) == 0:
+                break
+
+        # ---------- FORCE EXIT REMAINDERS ----------
+        for gi in active.tolist():
+            final_logits[gi] = best_logits[gi]
+            final_layers[gi] = best_layers[gi]
+
+        # ---------- STACK & RETURN ----------
+        preds = torch.stack(final_logits, dim=0)
+        # keep legacy 2000‑wide ASCII tensor (unchanged)
+        ascii_mat = torch.nn.utils.rnn.pad_sequence(
+            [torch.tensor([ord(c) for c in s], device=device) for s in sequences],
+            batch_first=True, padding_value=0,
+        )
+        if ascii_mat.size(1) < 2000:
+            pad = ascii_mat.new_zeros(ascii_mat.size(0), 2000 - ascii_mat.size(1))
+            ascii_mat = torch.cat([ascii_mat, pad], dim=1)
+
+        return {
+            "pred": preds,
+            "layers": torch.tensor(final_layers, device=device, dtype=torch.int64),
+            "computed_layers":torch.tensor(computed_layers, device=self.device, dtype=torch.int64),
+            "sequences": ascii_mat,
+        }
+
+    def target(self, batch):
+        return batch["targets"]
+
+    def evaluate(self, preds, target):
+        result = {}
+        pred  = preds["pred"]
+        layers = preds["layers"]
+        computed_layers = preds["computed_layers"]
+        sequences = preds["sequences"]
+        target = target.to(pred.device)
+
+        metric_out = {}
+        m = self.metric
+        if m == "f1_max":
+            score = metrics.f1_max(pred, target)
+            metric_out[m] = score.item()
+        else:
+            raise ValueError(f"Unknown metric {m}")
+
+        freq = torch.bincount(layers.cpu())
+        avg_layer = (torch.arange(len(freq), device=freq.device) * freq).sum() / freq.sum()
+
+        computed_layer_frequencies = torch.bincount(computed_layers)
+        total_computed = computed_layer_frequencies.sum()
+        computed_layer_indices = torch.arange(len(computed_layer_frequencies), device=computed_layer_frequencies.device)
+        average_computed_layer = (computed_layer_indices * computed_layer_frequencies).sum() / total_computed
+
+
+        result["avg_layer"] = avg_layer.item()
+        result["avg_computed_layer"] = average_computed_layer.item()
+        result[m] = metric_out[m]
+        return result
+    
+
+
+##### CONFIDENCE METRICS #######
+@R.register("tasks.Classification_confidence_ProtBert")
+class Classification_confidence_ProtBert(Classification_walltime_ProtBert):
+    def __init__(self, model, metric=('f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer):
+        super().__init__(model, metric=('f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer)
+    def evaluate(self, preds, target):
+        metric_out = evaluate_classification(preds, target, self.metric)
+        return metric_out
+
+@R.register("tasks.Classification_confidence_ESM")
+class Classification_confidence_ESM(Classification_walltime_ESM):
+    def __init__(self, model, metric=('f1_max'), verbose=0, num_class=1, weight=None, confidence_threshold=None):
+        super().__init__(model, metric=('f1_max'), verbose=0, num_class=1, weight=None, confidence_threshold=None)
+    def evaluate(self, preds, target):
+        metric_out = evaluate_classification(preds, target, self.metric, self.num_class)
+        return metric_out
+  
+@R.register("tasks.Property_confidence_ProtBert") 
+class Property_confidence_ProtBert(Property_walltime_ProtBert):
+    def __init__(self, model, task=(), metric=("acc"), criterion="mse", num_mlp_layer=2, #switched to 2
+                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0):
+        super().__init__(model, task=task, metric=metric, criterion=criterion, num_mlp_layer=num_mlp_layer, #switched to 2
+                 normalization=False, num_class=num_class, mlp_batch_norm = mlp_batch_norm, mlp_dropout = mlp_dropout,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0)
+    def evaluate(self, preds, target):
+        metric_out = evaluate_property_confidence(preds, target, self.num_class)
+        return metric_out
+    
+
+@R.register("tasks.Property_confidence_ESM")
+class Property_confidence_ESM(NormalProperty_continuous):
+    def __init__(self, model, task=(), criterion="mse", metric=("mae", "rmse"), num_mlp_layer=2, #switched to 2
+                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0):
+        super().__init__(model, task=task, metric=metric, criterion=criterion, num_mlp_layer=num_mlp_layer, #switched to 2
+                 normalization=False, num_class=num_class, mlp_batch_norm=mlp_batch_norm, mlp_dropout=mlp_dropout,
+                 graph_construction_model=None, confidence_threshold = None, verbose=0)
+    def evaluate(self, preds, target):
+        metric_out = evaluate_property_confidence(preds, target, self.num_class)
+        return metric_out
+    

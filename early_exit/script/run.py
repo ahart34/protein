@@ -268,31 +268,68 @@ if __name__ == "__main__":
         else:
             dataset = core.Configurable.load_config_dict(cfg.dataset)
         solver, scheduler = util.build_downstream_solver(cfg, dataset)
-        results = solver.evaluate("test")
-        preds = results["preds"]
-        target = results["target"]
-        metric = results[cfg.task.metric]
-        out_file_base= cfg.get("out_file_base")
-        pt_path = os.path.join(out_file_base + ".pt")
-        meta_path = os.path.join(out_file_base + ".json")
-        torch.save({
-            "preds_by_layer": preds,
-            "target": target,
-        },
-        pt_path
-        )
-        with open(meta_path, "w") as f:
-            json.dump(
-                {
-                    "dataset_class": cfg.dataset["class"],
-                    "split": "test",
-                    "n_examples": int(target.shape[0]),
-                    "n_classes": int(target.shape[1]),
-                    "n_layers": int(len(preds)),
-                },
-                f,
-                indent=2,
-        )
+        num_layers = int(cfg.get("num_layers"))
+        all_layer_preds = []
+        target = None
+        os.environ["OUT_FILE"] = str(cfg.out_file)
+        for layer in range(num_layers):
+            os.environ["LAYER"] = str(layer)
+            results = solver.evaluate("test")  # should return dict with preds/target/etc.
+            
+        #     # Grab target once (assumes target doesn't depend on layer)
+        #     if target is None:
+        #         target = results["target"]
+        #         # Ensure target is a tensor on CPU for saving
+        #         if torch.is_tensor(target):
+        #             target = target.detach().cpu()
+        #         else:
+        #             target = torch.as_tensor(target)
+
+        #     preds = results["preds"]
+
+        #     # Normalize preds into a single tensor [n_examples, n_classes] for this layer
+        #     # Common cases:
+        #     #  - preds is already a tensor
+        #     #  - preds is a list of tensors (batches) -> cat
+        #     if isinstance(preds, (list, tuple)):
+        #         preds = torch.cat([p.detach().cpu() if torch.is_tensor(p) else torch.as_tensor(p)
+        #                         for p in preds], dim=0)
+        #     else:
+        #         preds = preds.detach().cpu() if torch.is_tensor(preds) else torch.as_tensor(preds)
+
+        #     all_layer_preds.append(preds)
+
+        # # Stack into [n_layers, n_examples, n_classes]
+        # preds_by_layer = torch.stack(all_layer_preds, dim=0)
+
+        # out_file_base = cfg.get("out_file_base")
+        # pt_path = out_file_base + ".pt"
+        # meta_path = out_file_base + ".json"
+
+        # payload = {
+        #     "preds_by_layer": preds_by_layer,  # [L, N, C]
+        #     "target": target               # [N, C] (multi-label) or [N] / [N,1] depending on task
+        # }
+        # torch.save(payload, pt_path)
+
+        # # Metadata (don’t assume target is always 2D)
+        # n_examples = int(target.shape[0]) if hasattr(target, "shape") else None
+        # n_classes = int(target.shape[1]) if (hasattr(target, "shape") and len(target.shape) > 1) else None
+
+        # with open(meta_path, "w") as f:
+        #     json.dump(
+        #         {
+        #             "dataset_class": cfg.dataset["class"] if isinstance(cfg.dataset, dict) else str(cfg.dataset),
+        #             "n_examples": n_examples,
+        #             "n_classes": n_classes,
+        #             "n_layers": num_layers,
+        #             "preds_shape": list(preds_by_layer.shape),
+        #             "target_shape": list(target.shape) if hasattr(target, "shape") else None,
+        #             "task_metric": str(cfg.task.metric),
+        #         },
+        #         f,
+        #         indent=2,
+        #     )
     elif cfg.get("exit"):
         if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
             cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"

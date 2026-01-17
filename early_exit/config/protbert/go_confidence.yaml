@@ -1,8 +1,9 @@
 output_dir: ~/scratch/anna19/protein_confidence_output
 
 dataset:
-  class: EC
+  class: GO
   path: {{ datadir }}
+  level: {{level}}
   percent: 95
   transform:
     class: Compose
@@ -47,5 +48,5 @@ evaluate_confidence: True
 num_layers: 30
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ec/model_epoch49.pth
-out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ec_confidence.pt
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_go/model_epoch48.pth
+out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_go_confidence.pt

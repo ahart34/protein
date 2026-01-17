@@ -1,27 +1,29 @@
 output_dir: ~/scratch/anna19/protein_confidence_output
 
 dataset:
-  class: EC
-  path: {{ datadir }}
-  percent: 95
+  class: SubcellularLocalization
+  path: ~/scratch/anna19/subcell_localization/
+  atom_feature: null
+  bond_feature: null
   transform:
     class: Compose
     transforms:
-      - class: ProteinView
-        view: residue
       - class: TruncateProtein
         max_length: 550
+        random: True
+      - class: ProteinView
+        view: "residue"
 
 task:
-  class: Classification_confidence_ProtBert
+  class: Property_confidence_ProtBert
   model:
     class: CustomProtBert
     # path: {{ modeldir }}
     model: "CustomProtBert"
-    dropout: 0.2
-    batch_norm: True
-  metric: 'f1_max'
+  metric: 'acc'
   verbose: 1
+  num_mlp_layer: 2
+  num_class: 10
 
 optimizer:
   class: Adam
@@ -37,15 +39,14 @@ engine:
   batch_size: 8
   log_interval: 1000
 
-eval_metric: "f1_max"
+eval_metric: 'accuracy'
 freeze_model: True
-
 # Load the model with all layers trained MLPs
 load_weights_only: True
-pretrained_mlp_load_bert: True
+pretrained_mlp_load_property_bert: True
 evaluate_confidence: True
 num_layers: 30
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ec/model_epoch49.pth
-out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ec_confidence.pt
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_cl/model_epoch89.pth
+out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_cl_confidence.pt

@@ -13,11 +13,11 @@ dataset:
         max_length: 550
 
 task:
-  class: Classification_confidence_ProtBert
+  class: Classification_walltime_ProtAlbert
   model:
-    class: CustomProtBert
+    class: CustomProtAlbert
     # path: {{ modeldir }}
-    model: "CustomProtBert"
+    model: "CustomProtAlbert"
     dropout: 0.2
     batch_norm: True
   metric: 'f1_max'
@@ -42,10 +42,10 @@ freeze_model: True
 
 # Load the model with all layers trained MLPs
 load_weights_only: True
-pretrained_mlp_load_bert: True
-evaluate_confidence: True
-num_layers: 30
+pretrained_mlp_load_albert: True
+evaluate: True
+num_layers: 12
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ec/model_epoch49.pth
-out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ec_confidence.pt
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/albert_ec/model_epoch47.pth
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/albert_ec_eval.csv

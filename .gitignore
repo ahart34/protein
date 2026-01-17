@@ -3,3 +3,4 @@ early_exit/results/
 log.txt
 attention_analysis/results/
 log_attention_analysis.txt
+script/file_preview.py

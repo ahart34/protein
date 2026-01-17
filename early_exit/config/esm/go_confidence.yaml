@@ -1,8 +1,9 @@
 output_dir: ~/scratch/anna19/protein_confidence_output
 
 dataset:
-  class: EC
+  class: GO
   path: {{ datadir }}
+  level: {{level}}
   percent: 95
   transform:
     class: Compose
@@ -13,11 +14,11 @@ dataset:
         max_length: 550
 
 task:
-  class: Classification_confidence_ProtBert
+  class: Classification_confidence_ESM
   model:
-    class: CustomProtBert
+    class: CustomESM2
     # path: {{ modeldir }}
-    model: "CustomProtBert"
+    model: "CustomESM2"
     dropout: 0.2
     batch_norm: True
   metric: 'f1_max'
@@ -42,10 +43,10 @@ freeze_model: True
 
 # Load the model with all layers trained MLPs
 load_weights_only: True
-pretrained_mlp_load_bert: True
+pretrained_mlp_load: True
 evaluate_confidence: True
-num_layers: 30
+num_layers: 33
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ec/model_epoch49.pth
-out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ec_confidence.pt
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_go/model_epoch41.pth
+out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_go_confidence.pt

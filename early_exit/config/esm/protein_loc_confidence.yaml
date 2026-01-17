@@ -1,0 +1,52 @@
+output_dir: ~/scratch/anna19/protein_confidence_output
+
+dataset:
+  class: SubcellularLocalization
+  path: ~/scratch/anna19/subcell_localization/
+  atom_feature: null
+  bond_feature: null
+  transform:
+    class: Compose
+    transforms:
+      - class: TruncateProtein
+        max_length: 550
+        random: True
+      - class: ProteinView
+        view: "residue"
+
+task:
+  class: Property_confidence_ESM
+  model:
+    class: CustomESM2
+    # path: {{ modeldir }}
+    model: "CustomESM2"
+  metric: 'acc'
+  verbose: 1
+  num_mlp_layer: 2
+  num_class: 10
+
+optimizer:
+  class: Adam
+  lr: 1.0e-4
+
+scheduler:
+  class: ReduceLROnPlateau
+  factor: 0.6
+  patience: 5
+
+engine:
+  gpus: [0]
+  batch_size: 8
+  log_interval: 1000
+
+eval_metric: 'accuracy'
+freeze_model: True
+# Load the model with all layers trained MLPs
+load_weights_only: True
+pretrained_mlp_load_property: True
+evaluate_confidence: True
+num_layers: 33
+
+###Model 01####
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_cl/model_epoch84.pth
+out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_cl_confidence.pt
