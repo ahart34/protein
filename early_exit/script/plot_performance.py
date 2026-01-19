@@ -67,7 +67,7 @@ FILE_MAPPING = {
 }
 
 # List of model/task combinations to skip
-SKIP_LIST = ['bert_cl', 'esm_go', 'esm_ssp']
+SKIP_LIST = []
 
 # Models and tasks
 MODELS = ['bert', 'albert', 'esm']
@@ -130,22 +130,22 @@ def plot_model_task(model, task):
     plt.figure(figsize=(8, 6))
     
     # Plot eval data (Layer vs Performance) - Blue
-    plt.plot(eval_df['Layer'], eval_df[perf_metric], marker='o', markersize=4, linewidth=2, color='blue')
+    plt.plot(eval_df['Layer'], eval_df[perf_metric], marker='o', markersize=4, linewidth=2, color='blue', label='Single Layer')
     
     # Plot early exit last (Average Computed Layer vs Performance) - Green
     plt.plot(exit_last_df['Average Computed Layer'], exit_last_df[perf_metric], 
-             marker='s', markersize=4, linewidth=2, color='green')
+             marker='s', markersize=4, linewidth=2, color='green', label='Early Exit - Last Layer Default')
     
     # Plot early exit max (Average Computed Layer vs Performance) - Orange
     plt.plot(exit_max_df['Average Computed Layer'], exit_max_df[perf_metric], 
-             marker='^', markersize=4, linewidth=2, color='orange')
+             marker='^', markersize=4, linewidth=2, color='orange', label='Early Exit - Most Confident Layer Default')
     
     # Draw horizontal line for last layer performance
     last_layer_perf = eval_df[perf_metric].iloc[-1]
-    plt.axhline(y=last_layer_perf, color='black', linestyle='-', linewidth=2)
+    plt.axhline(y=last_layer_perf, color='black', linestyle='-', linewidth=2, label='Last Layer Performance')
     
     # Set labels and title
-    plt.xlabel('Average Number of Computed Layers', fontsize=14)
+    plt.xlabel('Average Computed Layer', fontsize=14)
     plt.ylabel('Performance', fontsize=14)
     plt.title(f'{task.upper()} - {model.upper()}', fontsize=18)
     
@@ -159,8 +159,37 @@ def plot_model_task(model, task):
     
     print(f"Saved plot for {model_task} to {output_file}")
 
+def create_legend_only():
+    """Create a separate PNG file with just the legend."""
+    fig = plt.figure(figsize=(6, 3))
+    ax = fig.add_subplot(111)
+    
+    # Create dummy plots to generate legend entries
+    ax.plot([], [], marker='o', markersize=8, linewidth=2, color='blue', label='Single Layer')
+    ax.plot([], [], marker='s', markersize=8, linewidth=2, color='green', label='Early Exit - Last Layer Default')
+    ax.plot([], [], marker='^', markersize=8, linewidth=2, color='orange', label='Early Exit - Most Confident Layer Default')
+    ax.plot([], [], linestyle='-', linewidth=2, color='black', label='Last Layer Performance')
+    
+    # Remove axes
+    ax.axis('off')
+    
+    # Create legend (stacked vertically)
+    legend = ax.legend(loc='center', fontsize=14, frameon=True, framealpha=1.0, 
+                      edgecolor='black', ncol=1)
+    
+    # Save just the legend
+    output_file = 'results/plots/legend_only.png'
+    plt.savefig(output_file, dpi=300, bbox_inches='tight', pad_inches=0.1)
+    plt.close()
+    
+    print(f"Saved legend to {output_file}")
+
 # Main execution
 if __name__ == "__main__":
+    # Create legend file
+    create_legend_only()
+    
+    # Create individual plots
     for model in MODELS:
         for task in TASKS:
             plot_model_task(model, task)

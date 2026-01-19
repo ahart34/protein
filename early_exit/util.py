@@ -156,9 +156,9 @@ def build_downstream_solver(cfg, dataset):
         cfg.task.weight = weights
     elif cfg.task['class'] == "NodePropertyPredictionAllLayers": #added
         cfg.task.num_class = 3
-    elif cfg.task['class'] in ["EarlyExitClassificationTemperature_Node", "EarlyExitClassificationTemperature_Node_continuous", "ClassificationTemperature_Node_continuous", "EarlyExitClassificationTemperature_Node_continuous_ProtBert", "EarlyExitClassificationTemperature_Node_continuous_ProtAlbert", "ClassificationTemperature_Node_continuous_ProtBert", "ClassificationTemperature_Node_continuous_ProtAlbert", "Property_Node_walltime_ProtBert"]:
+    elif cfg.task['class'] in ["EarlyExitClassificationTemperature_Node", "EarlyExitClassificationTemperature_Node_continuous", "ClassificationTemperature_Node_continuous", "EarlyExitClassificationTemperature_Node_continuous_ProtBert", "EarlyExitClassificationTemperature_Node_continuous_ProtAlbert", "ClassificationTemperature_Node_continuous_ProtBert", "ClassificationTemperature_Node_continuous_ProtAlbert", "Property_Node_walltime_ProtBert", "Property_Node_walltime_ProtBert_exit01"]:
         cfg.task.num_class = 3
-    elif cfg.task['class'] in ["EarlyExitClassification_walltime", "Classification_walltime_ESM", "EarlyExitClassification_walltime_analysis", "Classification_walltime_ProtBert", "Classification_walltime_ProtAlbert", "Classification_confidence_ProtBert", "Classification_confidence_ESM"]:
+    elif cfg.task['class'] in ["EarlyExitClassification_walltime", "Classification_walltime_ESM", "EarlyExitClassification_walltime_analysis", "Classification_walltime_ProtBert", "Classification_walltime_ProtAlbert", "Classification_confidence_ProtBert", "Classification_confidence_ESM", "Classification_confidence_ProtAlbert"]:
         cfg.task.num_class = num_classes
         cfg.task.weight = weights
 

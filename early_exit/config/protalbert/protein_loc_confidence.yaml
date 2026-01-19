@@ -15,11 +15,11 @@ dataset:
         view: "residue"
 
 task:
-  class: EarlyExitProperty_continuous
+  class: Property_confidence_ProtAlbert
   model:
-    class: CustomESM2
+    class: CustomProtAlbert
     # path: {{ modeldir }}
-    model: "CustomESM2"
+    model: "CustomProtAlbert"
   metric: 'acc'
   verbose: 1
   num_mlp_layer: 2
@@ -39,14 +39,14 @@ engine:
   batch_size: 8
   log_interval: 1000
 
-eval_metric: 'acc'
+eval_metric: 'accuracy'
 freeze_model: True
 # Load the model with all layers trained MLPs
 load_weights_only: True
-pretrained_mlp_load_property: True
-exit_cl: True
-num_layers: 33
+pretrained_mlp_load_albert_property: True
+evaluate_confidence: True
+num_layers: 12
 
 ###Model 01####
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_cl/model_epoch84.pth
-result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_cl_exit.csv
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/albert_cl/model_epoch85.pth
+out_file: /shared/nas2/anna19/protein/early_exit/results/metrics/albert_cl_confidence.pt

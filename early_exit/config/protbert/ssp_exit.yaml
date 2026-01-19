@@ -44,7 +44,6 @@ engine:
 eval_metric: macro_acc
 freeze_model: True
 
-
 load_weights_only: True
 pretrained_mlp_load_property_bert: True
 num_layers: 30

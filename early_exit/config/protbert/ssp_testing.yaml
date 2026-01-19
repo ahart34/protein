@@ -16,7 +16,7 @@ dataset:
 test_split: cb513
 
 task:
-  class: Property_Node_walltime_ProtBert
+  class: EarlyExitClassificationTemperature_Node_continuous_ProtBert #Property_Node_walltime_ProtBert #Property_Node_walltime_ProtBert_exit01
   model:
     class: CustomProtBert
     #path: {{ modeldir }}
@@ -29,7 +29,7 @@ task:
 
 optimizer:
   class: Adam
-  lr: 2.0e-4
+  lr: 1.0e-4
 
 scheduler:
   class: ReduceLROnPlateau
@@ -48,7 +48,7 @@ freeze_model: True
 load_weights_only: True
 pretrained_mlp_load_property_bert: True
 num_layers: 30
-evaluate: True
+testing: True
 
 model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ssp/model_epoch52.pth
-result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ssp_eval_test.csv
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ssp_testing.csv

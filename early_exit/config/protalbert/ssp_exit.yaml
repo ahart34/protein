@@ -16,11 +16,11 @@ dataset:
 test_split: cb513
 
 task:
-  class: Property_Node_walltime_ProtBert
+  class: EarlyExitClassificationTemperature_Node_continuous_ProtAlbert
   model:
-    class: CustomProtBert
+    class: CustomProtAlbert
     #path: {{ modeldir }}
-    model: "CustomProtBert"
+    model: "CustomProtAlbert"
   criterion: ce
   metric: 'macro_acc'
   num_mlp_layer: 2
@@ -44,11 +44,10 @@ engine:
 eval_metric: macro_acc
 freeze_model: True
 
-
 load_weights_only: True
-pretrained_mlp_load_property_bert: True
-num_layers: 30
-evaluate: True
+pretrained_mlp_load_albert_property: True
+num_layers: 12
+exit_node: True
 
-model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/bert_ssp/model_epoch52.pth
-result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/bert_ssp_eval_test.csv
+model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/albert_ssp/model_epoch8.pth
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/albert_ssp_exit.csv

@@ -1,0 +1,12 @@
+Loaded: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_cl_confidence.pt
+target shape: (N=2773, P=1)
+preds_by_layer: 35 layers; first pred dim D=10
+
+=== Per-property inferred K (from target labels) ===
+prop 00: n_labeled=2773, min=0, max=9, n_unique=10, inferred_k=10
+
+=== Cross-check ===
+sum(inferred K) = 10, pred width D = 10
+OK: sum(K) matches pred width.
+
+Wrote JSON report to: ./file_preview._2.json

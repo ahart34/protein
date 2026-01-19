@@ -44,9 +44,9 @@ freeze_model: True
 # Load the model with all layers trained MLPs
 load_weights_only: True
 pretrained_mlp_load_property: True
-exit_cl: True
+testing_cl: True
 num_layers: 33
 
 ###Model 01####
 model_checkpoint: /shared/nas2/anna19/protein/early_exit/results/model_checkpoints/esm_cl/model_epoch84.pth
-result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_cl_exit.csv
+result_file: /shared/nas2/anna19/protein/early_exit/results/metrics/esm_cl_testing.csv

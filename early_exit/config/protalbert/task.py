@@ -3351,6 +3351,101 @@ class ClassificationTemperature_Node_continuous(tasks.Task, core.Configurable):
         return metric
 
 
+def evaluate_classification(preds, target, metric, num_class=None):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        if isinstance(metric, dict):
+            m = list(metric.keys())
+        else:
+            m = metric
+
+        if m == "auroc@micro":
+            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
+        elif m == "auprc@micro":
+            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
+        elif m == "f1_max":
+            score = metrics.f1_max(pred, target)
+        elif m == "acc" or "acc" in m:
+            m = "acc"
+            score = []
+            num_class = 0
+            for i, cur_num_class in enumerate(num_class):
+                _pred = pred[:, num_class:num_class + cur_num_class]
+                _target = target[:, i]
+                _labeled = labeled[:, i]
+                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+                score.append(_score)
+                num_class += cur_num_class
+            score = torch.stack(score)
+        else:
+            raise ValueError(f"Unknown metric {m}")
+        metric_out[m] = score.item()
+        layer_idx = int(os.getenv("LAYER"))
+        out_file = os.getenv("OUT_FILE")
+        
+        # Load existing data if file exists, or create new structure
+        if os.path.exists(out_file) and layer_idx >= 0:
+            data = torch.load(out_file)
+        else:
+            data = {"preds_by_layer": [], "target": None}
+        
+        # Append this layer's predictions
+        data["preds_by_layer"].append(pred.detach().cpu())
+        
+        # Store target once (first layer)
+        if data["target"] is None:
+            data["target"] = target.detach().cpu()
+        
+        # Save back to file
+        torch.save(data, out_file)
+        return metric_out
+
+def evaluate_property_confidence(preds, target, self_num_class):
+        result = {}
+        pred  = preds["pred"]
+        target = target.to(pred.device)
+
+        out_file = os.getenv("OUT_FILE")
+        layer_idx = int(os.getenv("LAYER"))
+
+        if os.path.exists(out_file):
+            data = torch.load(out_file, map_location="cpu")
+            # If file exists but doesn't match expected structure, reset
+            if not isinstance(data, dict) or "preds_by_layer" not in data:
+                data = {"preds_by_layer": [], "target": None}
+        else:
+            data = {"preds_by_layer": [], "target": None}
+
+        # Append this layer's logits
+        data["preds_by_layer"].append(pred.detach().cpu())
+
+        # Store target once (first write)
+        if data.get("target") is None:
+            data["target"] = target.detach().cpu()
+
+        torch.save(data, out_file)
+
+        labeled = ~torch.isnan(target)
+        metric_out = {}
+        m = "acc"
+        score = []
+        num_class = 0
+        for i, cur_num_class in enumerate(self_num_class):
+            _pred = pred[:, num_class:num_class + cur_num_class]
+            _target = target[:, i]
+            _labeled = labeled[:, i]
+            _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
+            score.append(_score)
+            num_class += cur_num_class
+        score = torch.stack(score)
+
+        metric_out[m] = score.item()
+
+        return metric_out
+
 ##### ProtAlbert ######
 
 @R.register("tasks.Classification_walltime_ProtAlbert") #--> old, was used for first max
@@ -4551,6 +4646,8 @@ class EarlyExitProperty_continuous_protalbert(tasks.Task, core.Configurable):
     def evaluate(self, preds, target):
         pred = preds["pred"]
         layers = preds["layers"]
+        sequences = preds["sequences"]
+        print(f"{pred.shape} pred.shape")
         print(f"self.num class {self.num_class}")
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         target = target.to(device)
@@ -4601,101 +4698,7 @@ class EarlyExitProperty_continuous_protalbert(tasks.Task, core.Configurable):
 
 
 
-### Confidence helper functions ### 
-def evaluate_classification(preds, target, metric, num_class=None):
-        result = {}
-        pred  = preds["pred"]
-        target = target.to(pred.device)
-        labeled = ~torch.isnan(target)
-        metric_out = {}
-        if isinstance(metric, dict):
-            m = list(metric.keys())
-        else:
-            m = metric
 
-        if m == "auroc@micro":
-            score = metrics.area_under_roc(pred.flatten(), target.long().flatten())
-        elif m == "auprc@micro":
-            score = metrics.area_under_prc(pred.flatten(), target.long().flatten())
-        elif m == "f1_max":
-            score = metrics.f1_max(pred, target)
-        elif m == "acc" or "acc" in m:
-            m = "acc"
-            score = []
-            num_class = 0
-            for i, cur_num_class in enumerate(num_class):
-                _pred = pred[:, num_class:num_class + cur_num_class]
-                _target = target[:, i]
-                _labeled = labeled[:, i]
-                _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
-                score.append(_score)
-                num_class += cur_num_class
-            score = torch.stack(score)
-        else:
-            raise ValueError(f"Unknown metric {m}")
-        metric_out[m] = score.item()
-        layer_idx = int(os.getenv("LAYER"))
-        out_file = os.getenv("OUT_FILE")
-        
-        # Load existing data if file exists, or create new structure
-        if os.path.exists(out_file) and layer_idx >= 0:
-            data = torch.load(out_file)
-        else:
-            data = {"preds_by_layer": [], "target": None}
-        
-        # Append this layer's predictions
-        data["preds_by_layer"].append(pred.detach().cpu())
-        
-        # Store target once (first layer)
-        if data["target"] is None:
-            data["target"] = target.detach().cpu()
-        
-        # Save back to file
-        torch.save(data, out_file)
-        return metric_out
-
-def evaluate_property_confidence(preds, target, self_num_class):
-        result = {}
-        pred  = preds["pred"]
-        target = target.to(pred.device)
-
-        out_file = os.getenv("OUT_FILE")
-        layer_idx = int(os.getenv("LAYER"))
-
-        if os.path.exists(out_file):
-            data = torch.load(out_file, map_location="cpu")
-            # If file exists but doesn't match expected structure, reset
-            if not isinstance(data, dict) or "preds_by_layer" not in data:
-                data = {"preds_by_layer": [], "target": None}
-        else:
-            data = {"preds_by_layer": [], "target": None}
-
-        # Append this layer's logits
-        data["preds_by_layer"].append(pred.detach().cpu())
-
-        # Store target once (first write)
-        if data.get("target") is None:
-            data["target"] = target.detach().cpu()
-
-        torch.save(data, out_file)
-
-        labeled = ~torch.isnan(target)
-        metric_out = {}
-        m = "acc"
-        score = []
-        num_class = 0
-        for i, cur_num_class in enumerate(self_num_class):
-            _pred = pred[:, num_class:num_class + cur_num_class]
-            _target = target[:, i]
-            _labeled = labeled[:, i]
-            _score = metrics.accuracy(_pred[_labeled], _target[_labeled].long())
-            score.append(_score)
-            num_class += cur_num_class
-        score = torch.stack(score)
-
-        metric_out[m] = score.item()
-
-        return metric_out
 
 
 
@@ -4744,23 +4747,3 @@ class Property_confidence_ESM(NormalProperty_continuous):
         metric_out = evaluate_property_confidence(preds, target, self.num_class)
         return metric_out
     
-@R.register("tasks.Classification_confidence_ProtAlbert")
-class Classification_confidence_ProtAlbert(Classification_walltime_ProtAlbert):
-    def __init__(self, model, metric=('f1_max'), verbose=0, num_class=1, weight=None, tokenizer=AutoTokenizer):
-        super().__init__(model, metric=('f1_max'), verbose=verbose, num_class=num_class, weight=weight, tokenizer=tokenizer)
-        self.num_class = num_class
-    def evaluate(self, preds, target):
-        metric_out = evaluate_classification(preds, target, self.metric, self.num_class)
-        return metric_out
-  
-@R.register("tasks.Property_confidence_ProtAlbert") 
-class Property_confidence_ProtAlbert(Property_continuous_protalbert):
-    def __init__(self, model, task=(), metric=("acc"), criterion="mse", num_mlp_layer=2, #switched to 2
-                 normalization=False, num_class=None, mlp_batch_norm=False, mlp_dropout=0,
-                 graph_construction_model=None, confidence_threshold = None, verbose=0):
-        super().__init__(model, task=task, metric=metric, criterion=criterion, num_mlp_layer=num_mlp_layer, #switched to 2
-                 normalization=False, num_class=num_class, mlp_batch_norm = mlp_batch_norm, mlp_dropout = mlp_dropout,
-                 graph_construction_model=None, confidence_threshold = None, verbose=0)
-    def evaluate(self, preds, target):
-        metric_out = evaluate_property_confidence(preds, target, self.num_class)
-        return metric_out

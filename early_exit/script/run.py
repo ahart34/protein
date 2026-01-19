@@ -392,7 +392,7 @@ if __name__ == "__main__":
                         f.flush()
                     t = min(t + step, target)
                 d += 1 
-    elif cfg.get("exit_node"):
+    elif cfg.get("exit_cl"):
         if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
             cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
             train_set = core.Configurable.load_config_dict(cfg.dataset)
@@ -413,15 +413,236 @@ if __name__ == "__main__":
                 result_file = f"{root}_last{ext}"
             else:
                 result_file = f"{root}_max{ext}"
+            ## Getting min layer ##
+            t = 0
+            os.environ["THRESHOLD"] = str(t)
+            print(f"evaluating on threshold {t}")
+            times = time.time()
+            metric = solver.evaluate("test")
+            timef = time.time()
+            acc = metric[cfg.task.metric]
+            timee = timef - times
+            layer = metric["avg_layer"]
+            computed_layer = metric["avg_computed_layer"]
+            with open(result_file, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow(["Threshold", cfg.task.metric, "Average Exit Layer", "Average Computed Layer", "Time"])
+                writer.writerow([t, acc, layer, computed_layer, timee])
+
+            ##Getting max layer ### 
+            t = 1 
+            os.environ["THRESHOLD"] = str(t)
+            print(f"evaluating on threshold {t}")
+            times = time.time()
+            metric = solver.evaluate("test")
+            timef = time.time()
+            acc = metric[cfg.task.metric]
+            timee = timef - times
+            layer = metric["avg_layer"]
+            computed_layer = metric["avg_computed_layer"]
+            with open(result_file, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([t, acc, layer, computed_layer, timee])
+            max_layer = layer
+
+            ##Iterating through ##
+            t = 0
+            layer = 0
+            d = 1
+            while layer < max_layer * .95: 
+                target = 1 - 2*10**(-d)
+                step = 2*10**(-d)
+                i = 0
+                while t < target: 
+                    if i % 2 == 0: #doing half number of runs to save time
+                        os.environ["THRESHOLD"] = str(t) 
+                        times = time.time()
+                        metric = solver.evaluate("test")
+                        timef = time.time()
+                        acc = metric[cfg.task.metric]
+                        timee = timef - times
+                        layer = metric["avg_layer"]
+                        computed_layer = metric["avg_computed_layer"]
+                        with open(result_file, 'a') as f:
+                            writer = csv.writer(f)
+                            writer.writerow([t, acc, layer, computed_layer, timee])
+                            f.flush()
+                    t = min(t + step, target)
+                    i += 1
+                d += 1 
+
+
+    elif cfg.get("testing"):
+        # if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+        #     cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+        #     train_set = core.Configurable.load_config_dict(cfg.dataset)
+        #     cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+        #     valid_set = core.Configurable.load_config_dict(cfg.dataset)
+        #     cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
+        #     test_set = core.Configurable.load_config_dict(cfg.dataset)
+        #     dataset = (valid_set, valid_set, test_set)
+        # else:
+        #     dataset = core.Configurable.load_config_dict(cfg.dataset)
+        # solver, scheduler = util.build_downstream_solver(cfg, dataset)
+        # os.environ["SELECT_LAST"] = "True"
+        # result_file = cfg.get("result_file")
+        # test_set = core.Configurable.load_config_dict(cfg.dataset)
+        # solver.test_set = test_set
+
+
+        if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+            cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+            train_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+            valid_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
             test_set = core.Configurable.load_config_dict(cfg.dataset)
-            solver.test_set = test_set
+            dataset = (train_set, valid_set, test_set)
+        else:
+            dataset = core.Configurable.load_config_dict(cfg.dataset)
+        solver, scheduler = util.build_downstream_solver(cfg, dataset)
+        os.environ["SELECT_LAST"] = "True"
+        result_file = cfg.get("result_file")
+
+        with open(result_file, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([cfg.task.metric, "Average Exit Layer", "Average Computed Layer"])
+        os.environ["PERCENT"] = str(0)
+        os.environ["THRESHOLD"] = str(0)
+        metric = solver.evaluate("test")
+        acc = metric[cfg.task.metric]
+        layer = metric["avg_layer"]
+        computed_layer = metric["avg_computed_layer"]
+        with open(result_file, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([acc, layer, computed_layer])
+        os.environ["PERCENT"] = str(1)
+        os.environ["THRESHOLD"] = str(1)
+        metric = solver.evaluate("test")
+        acc = metric[cfg.task.metric]
+        layer = metric["avg_layer"]
+        computed_layer = metric["avg_computed_layer"]
+        with open(result_file, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([acc, layer, computed_layer])
+
+        os.environ["SELECT_LAST"] = "False"
+
+
+        with open(result_file, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([cfg.task.metric, "Average Exit Layer", "Average Computed Layer"])
+        os.environ["PERCENT"] = str(0)
+        os.environ["THRESHOLD"] = str(0)
+        metric = solver.evaluate("test")
+        acc = metric[cfg.task.metric]
+        layer = metric["avg_layer"]
+        computed_layer = metric["avg_computed_layer"]
+        with open(result_file, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([acc, layer, computed_layer])
+        os.environ["PERCENT"] = str(1)
+        os.environ["THRESHOLD"] = str(1)
+        metric = solver.evaluate("test")
+        acc = metric[cfg.task.metric]
+        layer = metric["avg_layer"]
+        computed_layer = metric["avg_computed_layer"]
+        with open(result_file, 'a') as f:
+            writer = csv.writer(f)
+            writer.writerow([acc, layer, computed_layer])
+
+
+
+        # with open(cfg.get("result_file"), 'w') as f:
+        #     writer = csv.writer(f)
+        #     writer.writerow(["Layer", cfg.task.metric, "Time"])
+        #     for layer in range(0, int(cfg.get("num_layers"))):
+        #         os.environ["LAYER"] = str(layer)
+        #         times = time.time()
+        #         results = solver.evaluate("test")   
+        #         timef = time.time()   
+        #         timee = timef - times
+        #         metric = results[cfg.task.metric]  
+        #         writer.writerow([layer, metric, timee])
+        #         f.flush()
+
+
+        # with open(result_file, 'a') as f:
+        #     writer = csv.writer(f)
+        #     writer.writerow([cfg.task.metric, "Average Exit Layer", "Average Computed Layer"])
+        # os.environ["PERCENT"] = str(0)
+        # os.environ["THRESHOLD"] = str(0)
+        # metric = solver.evaluate("test")
+        # acc = metric[cfg.task.metric]
+        # layer = metric["avg_layer"]
+        # computed_layer = metric["avg_computed_layer"]
+        # with open(result_file, 'a') as f:
+        #     writer = csv.writer(f)
+        #     writer.writerow([acc, layer, computed_layer])
+        # os.environ["PERCENT"] = str(1)
+        # os.environ["THRESHOLD"] = str(1)
+        # metric = solver.evaluate("test")
+        # acc = metric[cfg.task.metric]
+        # layer = metric["avg_layer"]
+        # computed_layer = metric["avg_computed_layer"]
+        # with open(result_file, 'a') as f:
+        #     writer = csv.writer(f)
+        #     writer.writerow([acc, layer, computed_layer])
+    elif cfg.get("exit_node"):
+        if cfg.dataset["class"] in ["EC", "GO", "MyFold"]:
+            cfg.dataset.split = "training" if cfg.dataset["class"] == "MyFold" else "train"
+            train_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "validation" if cfg.dataset["class"] == "MyFold" else "valid"
+            valid_set = core.Configurable.load_config_dict(cfg.dataset)
+            cfg.dataset.split = "test_fold" if cfg.dataset["class"] == "MyFold" else "test"
+            test_set = core.Configurable.load_config_dict(cfg.dataset)
+            dataset = (train_set, valid_set, test_set)
+        else:
+            dataset = core.Configurable.load_config_dict(cfg.dataset)
+        solver, scheduler = util.build_downstream_solver(cfg, dataset)
+
+        for select_last in ("True", "False"):
+            os.environ["SELECT_LAST"] = select_last
+            result_file = cfg.get("result_file")
+            root, ext = os.path.splitext(result_file)
+            if select_last == "True":
+                result_file = f"{root}_last{ext}"
+            else:
+                result_file = f"{root}_max{ext}"
             with open(result_file, 'a') as f:
                 writer = csv.writer(f)
                 writer.writerow(["Percent", "Threshold", cfg.task.metric, "Average Exit Layer", "Average Computed Layer", "Time"])
-            for p in np.arange(.8, 1, .05):
+
+            os.environ["PERCENT"] = str(0)
+            os.environ["THRESHOLD"] = str(0)
+            times = time.time()
+            metric = solver.evaluate("test")
+            timef = time.time()
+            timee = timef - times
+            acc = metric[cfg.task.metric]
+            layer = metric["avg_layer"]
+            computed_layer = metric["avg_computed_layer"]
+            with open(result_file, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([0, 0, acc, layer, computed_layer, timee])
+
+
+            os.environ["PERCENT"] = str(1)
+            os.environ["THRESHOLD"] = str(1)
+            times = time.time()
+            metric = solver.evaluate("test")
+            timef = time.time()
+            timee = timef - times
+            acc = metric[cfg.task.metric]
+            layer = metric["avg_layer"]
+            computed_layer = metric["avg_computed_layer"]
+            with open(result_file, 'a') as f:
+                writer = csv.writer(f)
+                writer.writerow([1, 1, acc, layer, computed_layer, timee])
+
+            for p in np.arange(.8, 1, .1):
                 os.environ["PERCENT"] = str(p)
                 avg_layer = 0
-                d = 1
                 t = 1 
                 os.environ["THRESHOLD"] = str(t)
                 print(f"evaluating on threshold {t} percent {p}")
@@ -438,24 +659,84 @@ if __name__ == "__main__":
                 max_layer = layer
                 t = 0
                 layer = 0
-                while layer < max_layer * .95: 
-                    target = 1 - 2*10**(-d)
-                    step = 2*10**(-d)
-                    while t < target: 
-                        os.environ["THRESHOLD"] = str(t) 
-                        times = time.time()
-                        metric = solver.evaluate("test")
-                        timef = time.time()
-                        acc = metric[cfg.task.metric]
-                        timee = timef - times
-                        layer = metric["avg_layer"]
-                        computed_layer = metric["avg_computed_layer"]
-                        with open(result_file, 'a') as f:
-                            writer = csv.writer(f)
-                            writer.writerow([p, t, acc, layer, computed_layer, timee])
-                            f.flush()
-                        t = min(t + step, target)
-                    d += 1 
+
+                t = 0
+                while layer < 1:
+                    t += .1
+                    os.environ["THRESHOLD"] = str(t) 
+                    times = time.time()
+                    metric = solver.evaluate("test")
+                    timef = time.time()
+                    acc = metric[cfg.task.metric]
+                    timee = timef - times
+                    layer = metric["avg_layer"]
+                    computed_layer = metric["avg_computed_layer"]
+                    with open(result_file, 'a') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([p, t, acc, layer, computed_layer, timee])
+                        f.flush()
+                while layer < max_layer*.95:
+                    t += .01
+                    os.environ["THRESHOLD"] = str(t) 
+                    times = time.time()
+                    metric = solver.evaluate("test")
+                    timef = time.time()
+                    acc = metric[cfg.task.metric]
+                    timee = timef - times
+                    layer = metric["avg_layer"]
+                    computed_layer = metric["avg_computed_layer"]
+                    with open(result_file, 'a') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([p, t, acc, layer, computed_layer, timee])
+                        f.flush()
+                while t < 1:
+                    t += .1
+                    os.environ["THRESHOLD"] = str(t) 
+                    times = time.time()
+                    metric = solver.evaluate("test")
+                    timef = time.time()
+                    acc = metric[cfg.task.metric]
+                    timee = timef - times
+                    layer = metric["avg_layer"]
+                    computed_layer = metric["avg_computed_layer"]
+                    with open(result_file, 'a') as f:
+                        writer = csv.writer(f)
+                        writer.writerow([p, t, acc, layer, computed_layer, timee])
+                        f.flush()
+
+                # for t in np.concatenate([np.arange(0.0, 0.4, 0.2),np.arange(0.4, 1.0, 0.05)]):
+                # #for t in range(0, .4, .2) and range(.4, 1, .05):
+                #     os.environ["THRESHOLD"] = str(t) 
+                #     times = time.time()
+                #     metric = solver.evaluate("test")
+                #     timef = time.time()
+                #     acc = metric[cfg.task.metric]
+                #     timee = timef - times
+                #     layer = metric["avg_layer"]
+                #     computed_layer = metric["avg_computed_layer"]
+                #     with open(result_file, 'a') as f:
+                #         writer = csv.writer(f)
+                #         writer.writerow([p, t, acc, layer, computed_layer, timee])
+                #         f.flush()
+
+                # while layer < max_layer * .95: 
+                #     target = 1 - 2*10**(-d)
+                #     step = 2*10**(-d)
+                #     while t < target: 
+                #         os.environ["THRESHOLD"] = str(t) 
+                #         times = time.time()
+                #         metric = solver.evaluate("test")
+                #         timef = time.time()
+                #         acc = metric[cfg.task.metric]
+                #         timee = timef - times
+                #         layer = metric["avg_layer"]
+                #         computed_layer = metric["avg_computed_layer"]
+                #         with open(result_file, 'a') as f:
+                #             writer = csv.writer(f)
+                #             writer.writerow([p, t, acc, layer, computed_layer, timee])
+                #             f.flush()
+                #         t = min(t + step, target)
+                #     d += 1 
 
 
 

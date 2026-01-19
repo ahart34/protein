@@ -44,7 +44,7 @@ freeze_model: True
 # Load the model with all layers trained MLPs
 load_weights_only: True
 pretrained_mlp_load_property_bert: True
-exit: True
+exit_cl: True
 num_layers: 30
 
 ###Model 01####
