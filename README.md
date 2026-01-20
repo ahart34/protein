@@ -43,3 +43,6 @@ conda env create -f early_exit/early_exit.yml
 conda activate early_exit
 
 # References: 
+This code utilizes the TorchDrug Framework: https://torchdrug.ai
+Code for building MLP and handling GO and EC datasets utilizes aspects of code in https://github.com/DeepGraphLearning/esm-s/tree/main and code for run.py and handling CL and SSP datasets utilizes aspects of code in https://github.com/DeepGraphLearning/PEER_Benchmark/blob/main
+Datasets GO, EC, CL, and SSP are obtained as stated in our paper and will be downloaded by following instructions above. 
