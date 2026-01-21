@@ -6,7 +6,41 @@
 ## Early Exit: 
 - To download GO and EC datasets, Follow "Download Datasets and Model Weights" from Zhang et al. Github: https://github.com/DeepGraphLearning/esm-s/tree/main
 - CL and SSP datasets will download automatically when running algorithms
-- Please reference our paper for original sources of data
+
+## Data References: 
+- UniProt: The UniProt Consortium, A. Bateman, M.-J. Martin,
+S. Orchard, et al. UniProt: the universal protein
+knowledgebase in 2023. Nucleic Acids Research, 51:D523–
+D531, 2023.
+- SlimPajama-6B: Dongkeyun Yoon. SlimPajama-6b. https://huggingface.co/
+datasets/DKYoon/SlimPajama-6B, 2023.
+- GO and EC:
+  - Data split found in: Z. Zhang, J. Lu, V. Chenthamarakshan, et al. Structure-
+informed protein language model. GEM Workshop, ICLR,
+2024.
+  - Original Data Source: V. Gligorijevi´c, P. D. Renfrew, T. Kosciolek, et al. Structure-
+based protein function prediction using graph convolutional
+networks. Nature Communications, 12(1):3168, 2021. ISSN
+2041-1723.
+- CL and SSP:
+  - Data split found in: M. Xu, Z. Zhang, J. Lu, et al. PEER: A comprehensive and
+multi-task benchmark for protein sequence understanding.
+In Advances in Neural Information Processing Systems
+35: Annual Conference on Neural Information Processing
+Systems 2022, NeurIPS 2022, New Orleans, LA, USA,
+November 28 - December 9, 2022, 2022.
+  - Original Data Souce:
+    - CL: J. J. Almagro Armenteros, C. K. Sønderby, S. K. Sønderby,
+et al. DeepLoc: prediction of protein subcellular localization using deep learning. Bioinformatics, 33(21):3387–3395,
+2017. ISSN 1367-4803, 1367-4811.
+    - SSP: M. S. Klausen, M. C. Jespersen, H. Nielsen, et al. NetSurfP-
+2.0: Improved prediction of protein structural features by
+integrated deep learning. Proteins: Structure, Function,
+and Bioinformatics, 87(6):520–527, 2019. ISSN 0887-3585,
+1097-0134. J. A. Cuff and G. J. Barton. Evaluation and improvement of
+multiple sequence methods for protein secondary structure
+prediction. Proteins: Structure, Function, and Genetics,
+34(4):508–519, 1999. ISSN 0887-3585, 1097-0134
 
 
 # Running Code: 
@@ -47,6 +81,7 @@ conda activate early_exit
 Code for building MLP and handling GO and EC datasets utilizes aspects of code in https://github.com/DeepGraphLearning/esm-s/tree/main (Zhang et al. "Structure-Informed Protein Language Model") and code for run.py and handling CL and SSP datasets utilizes aspects of code in https://github.com/DeepGraphLearning/PEER_Benchmark/blob/main (Xu et al. "PEER: A Comprehensive and Multi-Task Benchmark for Protein Sequence Understanding") <br/>
 This code utilizes TorchDrug https://torchdrug.ai <br/>
 Datasets GO, EC, CL, and SSP are obtained as stated in our paper and will be downloaded by following instructions above. 
+
 
 
 
